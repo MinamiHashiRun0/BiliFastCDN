@@ -11,7 +11,7 @@
   var K_STATS = "bili_fast_cdn.stats.v1";
 
   // Surge 对远程脚本默认缓存 86400 秒，面板标题带版本号才能确认设备上跑的是哪一版。
-  var VERSION = "0.1.5";
+  var VERSION = "0.1.6";
   var PANEL_TITLE = "B站CDN";
   var REASON_LABELS = {
     "force-host": "全量改写",
@@ -590,9 +590,16 @@
   function emptyStats() {
     return {
       calls: 0, signals: 0, rewrites: 0, liveDropped: 0,
-      grpcCalls: 0, grpcRewrites: 0,
+      grpcCalls: 0, grpcRewrites: 0, grpcLast: null,
       mediaCalls: 0, mediaRewrites: 0, last: null, lastNotifyAt: 0
     };
+  }
+
+  function humanBytes(n) {
+    if (!(n > 0)) return "0";
+    if (n < 1024) return n + "B";
+    if (n < 1048576) return Math.round(n / 1024) + "KB";
+    return (Math.round(n / 104857.6) / 10) + "MB";
   }
 
   function loadStats() {
@@ -612,9 +619,20 @@
   function recordResponse(cfg, stats, isLive, rank) {
     var state = loadStats();
     if (stats.binary) {
-      // gRPC 层单独计数：它和 JSON 层的失败模式完全不同（引擎能力 / 二进制 body）
+      // gRPC 层单独计数：它和 JSON 层的失败模式完全不同（引擎能力 / 二进制 body）。
+      // 同时把最近一次的帧结构信息存进面板，这样不用翻日志就能看出为什么改写是 0。
       state.grpcCalls += 1;
       state.grpcRewrites += stats.grpcRewrites;
+      if (stats.grpcInfo) {
+        state.grpcLast = {
+          at: Date.now(),
+          bytes: stats.grpcInfo.bytes,
+          frames: stats.grpcInfo.frames,
+          compressed: stats.grpcInfo.compressed,
+          framed: stats.grpcInfo.framed,
+          rewrites: stats.grpcRewrites
+        };
+      }
     } else {
       state.calls += 1;
       if (stats.signal) state.signals += 1;
@@ -886,7 +904,15 @@
     }
 
     lines.push("接口 触发" + state.calls + " 媒体" + state.signals + " 改写" + state.rewrites);
-    lines.push("gRPC 扫描" + state.grpcCalls + " 改写" + state.grpcRewrites);
+    // gRPC 那行的尾巴直接给出最近一次的帧结构：改写为 0 时，这里就能看出是
+    // 压缩帧、不是帧结构，还是真的没有可换的主机名 —— 不必去翻日志。
+    var gTail = "";
+    if (state.grpcLast) {
+      var gl = state.grpcLast;
+      gTail = " · 最近 " + humanBytes(gl.bytes) + " 帧" + gl.frames + " 改写" + gl.rewrites +
+        (gl.compressed ? " 压缩" + gl.compressed : "") + (gl.framed ? "" : " 非帧");
+    }
+    lines.push("gRPC 扫描" + state.grpcCalls + " 改写" + state.grpcRewrites + gTail);
     lines.push("分片 扫描" + state.mediaCalls + " 改写" + state.mediaRewrites +
       (state.liveDropped ? " 直播剔除" + state.liveDropped : ""));
     if (state.last) {
@@ -1214,7 +1240,12 @@
           out = gres.out;
         }
         if (gstats.grpcRewrites) gstats.count = gstats.grpcRewrites;
-        else if (gres.compressed) gstats.count = 0;
+        gstats.grpcInfo = {
+          bytes: bytes.length,
+          frames: gres.frames,
+          compressed: gres.compressed,
+          framed: gres.framed
+        };
         recordResponse(cfg, gstats, false, gRank);
 
         if (cfg.debug) {

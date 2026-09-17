@@ -859,6 +859,11 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     check("the gRPC call is counted", JSON.parse(run.store[K_STATS]).grpcCalls, 1);
     check("the gRPC rewrite is counted", JSON.parse(run.store[K_STATS]).grpcRewrites, 1);
     check("the gRPC layer leaves the payload counters alone", JSON.parse(run.store[K_STATS]).calls, 0);
+    // The frame structure of the last response is kept so the panel can explain a
+    // zero rewrite count without anyone having to find the log.
+    const lastG = JSON.parse(run.store[K_STATS]).grpcLast;
+    check("the last gRPC frame structure is recorded",
+      [lastG.frames, lastG.framed, lastG.rewrites], [1, true, 1]);
 
     const runOff = await runSurge({
       script: { type: "http-response" },
@@ -939,6 +944,7 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
       store: Object.assign({}, rankStore, {
         [K_STATS]: JSON.stringify({
           calls: 12, signals: 9, rewrites: 27, liveDropped: 3, grpcCalls: 23, grpcRewrites: 21,
+          grpcLast: { at: clock.now, bytes: 41984, frames: 1, compressed: 0, framed: true, rewrites: 21 },
           mediaCalls: 156, mediaRewrites: 150,
           last: { reason: "force-host", from: "upos-sz-mirrorcos.bilivideo.com", to: TARGET, at: clock.now },
           lastNotifyAt: 0
@@ -949,8 +955,8 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     check("style is good once rewrites happen", reported.donePayload.style, "good");
     checkTrue("it shows the payload layer counters",
       reported.donePayload.content.indexOf("接口 触发12 媒体9 改写27") !== -1);
-    checkTrue("it shows the gRPC layer counters separately",
-      reported.donePayload.content.indexOf("gRPC 扫描23 改写21") !== -1);
+    checkTrue("it shows the gRPC layer counters and the last frame shape",
+      reported.donePayload.content.indexOf("gRPC 扫描23 改写21 · 最近 41KB 帧1 改写21") !== -1);
     checkTrue("it shows the media layer counters separately",
       reported.donePayload.content.indexOf("分片 扫描156 改写150") !== -1);
     checkTrue("it shows the last move", reported.donePayload.content.indexOf("最近 全量改写：sz-mirrorcos → tf-all-hw") !== -1);
