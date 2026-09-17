@@ -746,6 +746,16 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
       api.categoryOf("upos-sz-mirrorhw.bstar1.bilivideo.com"), "bstar");
     check("category: a plain mirror is pcdn",
       api.categoryOf("upos-sz-mirrorcos.bilivideo.com"), "pcdn");
+    check("category: akamai has its own bucket",
+      api.categoryOf("upos-hz-mirrorakam.akamaized.net"), "akamai");
+
+    // Akamai 单独一个开关：填 hostAkamai 就等于"把 akam 换到它"，不需要动 rewriteAkamai。
+    const akamPin = await asRequest(AKAM, "mode=smart&hostAkamai=upos-sz-mirrorhw.bilivideo.com",
+      Object.assign({}, rankStore));
+    check("hostAkamai pins where akam goes",
+      hostOf(akamPin.donePayload.url), "upos-sz-mirrorhw.bilivideo.com");
+    const akamAuto = await asRequest(AKAM, "mode=smart", Object.assign({}, rankStore));
+    check("with hostAkamai=auto akam is left alone", akamAuto.donePayload, {});
 
     // 分片层的 pattern 只覆盖劣质家族：Surge 每次调用脚本都要重新加载并跑一遍那个 JS VM
     // （真机实测一次 20–300ms），而分片是一段视频几百上千次请求 —— 让健康分片白交这笔税
@@ -919,6 +929,10 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
       api.rewriteProto(mkBody(COSOV), cfg, ranked, fresh()), null);
     checkTrue("akamai moves once rewriteAkamai is on",
       api.rewriteProto(mkBody(AKAM), cfgMove, ranked, fresh()) !== null);
+    // hostAkamai 单独就能让字节层换掉 akam（App 的 playurl 里 akam 是候选之一）。
+    const akamByte = Object.assign({}, cfg, { hostAkamai: ALIOV });
+    checkTrue("hostAkamai alone moves akam in the byte layer",
+      api.rewriteProto(mkBody(AKAM), akamByte, ranked, fresh()) !== null);
     checkTrue("a pinned category target moves healthy hosts too",
       api.rewriteProto(mkBody(COSOV), cfgMove, ranked, fresh()) !== null);
     checkTrue("an mcdn host moves even without a ranking",

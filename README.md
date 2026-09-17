@@ -18,7 +18,7 @@ Surge iOS 模块：劫持 B 站 `playurl` / 直播 `playinfo` 接口，把视频
   **字节级 protobuf 改写器与全部判定实现均为本项目自写，未复制其代码**
 - 完整署名与上游许可全文：[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
 
-**真机验证范围。** 脚本逻辑有 343 项离线断言覆盖（含与上游逐条对照与合成 protobuf fixture）。
+**真机验证范围。** 脚本逻辑有 347 项离线断言覆盖（含与上游逐条对照与合成 protobuf fixture）。
 已在真机确认：模块安装、`[Panel]` 段落、分片层能截到明文 http 分片请求、debug 输出落在请求注释里。
 两次真机事故都进了回归测试：
 
@@ -28,7 +28,8 @@ Surge iOS 模块：劫持 B 站 `playurl` / 直播 `playinfo` 接口，把视频
    的结果（`203.121.59.225` = akam 边缘、`92.223.116.254` = cosov 边缘），不是 P2P；v0.3.0 起不再动它。
 3. **分片层在健康分片上白跑一趟也是成本**。同一条视频对照抓包：模块关闭时 27 条分片同时在飞、每条 30–55ms；
    模块开启时单条要 119/343ms，其中 27ms 与 **311ms** 花在我们的脚本里（网络部分都是 10–30ms）。
-   v0.4.0 起分片层的 pattern 收窄到劣质家族，健康分片不再进脚本。
+   v0.4.0 起分片层的 pattern 收窄到劣质家族，健康分片不再进脚本 —— 收窄后复测：31 条分片全部 206、
+   平均 35ms，脚本调用列表里已经看不到分片层（只剩 3 次 gRPC，174–296ms）。
 
 **gRPC 层真机已确认两件事**：默认引擎确实交付 Uint8Array body；而 App 的 playurl 响应**全是 gzip 帧**
 （实测 5/5，2990B 解压出 12476B message）—— 所以不解压就一次也改不动，`grpcGunzip` 是为此加的开关（默认关，
@@ -99,7 +100,7 @@ gRPC 层（字节层）与分片层在 `smart` 下**只清劣质节点，不碰�
 | --- | --- |
 | `BiliFastCDN.sgmodule` | 模块本体：`[Script]` / `[Panel]` / `[MITM]` / 参数表 |
 | `bili-cdn.js` | 一个文件四种角色：接口改写 / 分片改写 / 测速 / 面板，按运行上下文分派 |
-| `test/verify.html` | 离线验证套件，343 项断言，用浏览器跑 |
+| `test/verify.html` | 离线验证套件，347 项断言，用浏览器跑 |
 | `LICENSE` | MIT |
 | `THIRD-PARTY-NOTICES.md` | 上游 realzza/bilibili-accelerator 的 MIT 署名 |
 
@@ -115,6 +116,8 @@ gRPC 层（字节层）与分片层在 `smart` 下**只清劣质节点，不碰�
 | `grpcGunzip` | `false` | 是否先解开 gzip 帧再改 gRPC。App 的 playurl 实测全是 gzip 帧，不开则字节层一次也改不动；开启后改写过的帧按未压缩帧发回，客户端不认就会整条 playurl 失败，所以默认关 |
 | `mediaRewrite` | `true` | 是否启用明文 http 分片改写（官方 App 只有这层覆盖得到）。分片层的 pattern 只覆盖劣质家族，健康分片不会调用脚本 |
 | `hostPcdn` / `hostOversea` / `hostBStar` | `auto` | 分类目标覆盖。`auto` = 用测速排名第一；填主机名则固定用它。分类按**来源主机名**判定：`upos-sz-mirror*ov` 与 `cn-hk-eq-*` 属港澳台，`*bstar1` 属国际版，其余按大陆 |
+| `hostAkamai` | `auto` | Akamai 的目标主机。`auto` = **不动 Akamai**；填主机名 = 总是把 Akamai 换到它（等于同时打开 `rewriteAkamai`）。Akamai 在马来西亚这类地区效果差时，填一个测速好的镜像即可 |
+| `rewriteAkamai` | `false` | 是否把 Akamai 换掉（目标看 `hostAkamai`；它是 `auto` 时用测速排名第一）。给 `hostAkamai` 填了主机名就等于打开它 |
 | `hostMcdn` | `proxy-tf-all-ws.bilivideo.com` | MCDN 的目标节点（默认代理包裹，与 realzza、Biliverse/Redirect 两者的默认一致） |
 | `backupFanout` | `true` | 把候选节点写进 `backupUrl`，让播放器自己也能容错切换 |
 | `liveFilter` | `true` | 从直播 `url_info` 中剔除 PCDN 节点 |
@@ -265,6 +268,13 @@ gRPC 那行尾巴是最近一次的**帧结构**，改写为 0 时靠它定位�
 - **测速排名只代表"测速那一刻、那条 DNS 解析路径"**。`-ov` 这类出海镜像的主机名在不同网络、不同解析器下会落到
   不同边缘，同一个主机名可以一边 206 一边 403（原因见上一条）。所以测速被否掉的候选会记进排名并在面板上显示，
   而分片层不再把全部流量押在排名第一上。
+- **多连接聚合（IDM 那种）做不到**。Surge 脚本能做的只有改写请求的 URL，没法把一条客户端请求拆成多条 Range
+  并发再合并回同一个响应 —— 那需要下载器/代理层面的支持，不是一个模块能提供的。播放器自己已经在并发拉分片
+  （真机抓包里同一瞬间 27 条分片在飞），所以"聚合网速"这件事本来就在客户端完成，我们能改的只有**用哪个主机**。
+- **换掉 Akamai 要动的是 URL 里的主机名，不是把域名拉黑**。`hostAkamai` 填一个镜像（或打开 `rewriteAkamai`
+  用测速第一）之后，App 的 playurl 响应里 `*.akamaized.net` 的地址会当场被换掉（需要 `grpcGunzip=true`，
+  否则 gzip 帧改不动）；网页版走接口层，不需要额外开关。用 `RULE ... REJECT` 直接拉黑 akam 不在本模块范围内，
+  而且播放器不一定会在连接被拒后切到备选地址。
 - **直播**（`/live-bvc/`）只做 PCDN 剔除，不做域名替换 —— 那是另一套 CDN 层级，换域名会直接把直播打死。
 - **`debug` 不是常开开关**。手册写明它会 reload 脚本（每次执行重新加载），真机实测打开后我们每次调用要
   150–350ms；分片层是按请求调用的，一段视频就是几百上千次。诊断完请关掉 —— 常开时它会拖慢整机而不只是本模块。
