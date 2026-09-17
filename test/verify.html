@@ -3,7 +3,6 @@
 <title>running</title>
 <pre id="report">running…</pre>
 <script>
-// Surface anything that escapes the suite, instead of leaving "running…" behind.
 function fail(reason) {
   document.title = "ERROR";
   const el = document.getElementById("report");
@@ -14,17 +13,17 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
 </script>
 <script>
 /*
- * Offline verification for ../bili-cdn.js + ../BiliFastCDN.sgmodule.
+ * Offline verification for the three scripts and the two modules.
  *
- * The backend is a port of Biliverse/Redirect's Surge implementation
- * (src/process/Request.mjs + template/surge.handlebars, Apache-2.0). Every case
- * below is written with the upstream branch it mirrors named in the check, so a
- * regression shows which rule drifted.
+ *   bili-cdn.js        request-side rewriting (port of Redirect's Request.mjs)
+ *   bili-playurl.js    response-side rewriting of playurl (JSON + gRPC)
+ *   bili-speedtest.js  shared probe / ranking / panel
  *
- * Chrome refuses to read a file:// page's siblings without an explicit flag:
+ *   BiliFastCDN.sgmodule          request-side module
+ *   BiliFastCDN.PlayURL.sgmodule  response-side module
  *
- *   chrome --headless=new --disable-gpu --allow-file-access-from-files \
- *          --virtual-time-budget=20000 --dump-dom test/verify.html
+ * chrome --headless=new --disable-gpu --allow-file-access-from-files \
+ *        --virtual-time-budget=20000 --dump-dom test/verify.html
  */
 
 (async function () {
@@ -42,7 +41,6 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
   }
   function checkTrue(name, actual) { check(name, !!actual, true); }
   function note(text) { lines.push("   " + text); }
-
   function render(final) {
     const total = pass + failures.length;
     const head = final
@@ -51,45 +49,63 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     document.querySelector("#report").textContent = head + "\n" + lines.join("\n") +
       (failures.length ? "\n\nFAILURES\n\n" + failures.map((f) => "  " + f).join("\n\n") : "");
   }
-
-  function section(title) {
-    lines.push("");
-    lines.push("── " + title);
-    render(false);
-  }
+  function section(title) { lines.push(""); lines.push("── " + title); render(false); }
 
   const clock = { now: 1700000000000 };
   Date.now = () => clock.now;
 
-  async function readText(url) {
+  const readText = async (url) => {
     const res = await fetch(url);
     if (!res.ok) throw new Error("HTTP " + res.status);
     return res.text();
+  };
+
+  const SRC_REQUEST = await readText("../bili-cdn.js");
+  const SRC_PLAYURL = await readText("../bili-playurl.js");
+  const SRC_PROBE = await readText("../bili-speedtest.js");
+  const MOD_REQUEST = await readText("../BiliFastCDN.sgmodule");
+  const MOD_PLAYURL = await readText("../BiliFastCDN.PlayURL.sgmodule");
+
+  function apiOf(src) {
+    window.module = { exports: {} };
+    window.eval(src);
+    return window.module.exports;
   }
+  const req = apiOf(SRC_REQUEST);
+  const pl = apiOf(SRC_PLAYURL);
+  const probe = apiOf(SRC_PROBE);
+  const VERSION = req.VERSION;
 
-  const SOURCE = await readText("../bili-cdn.js");
-  const MODULE = await readText("../BiliFastCDN.sgmodule");
+  const K_RANK = req.K_RANK;
+  const K_STATS = probe.K_STATS;
+  const K_SAMPLE = probe.K_SAMPLE;
+  const RANK_A = "upos-tf-all-hw.bilivideo.com";
+  const rankStore = (hosts, extra) => ({
+    [K_RANK]: JSON.stringify(Object.assign({ at: clock.now, via: "sample", ranking: hosts, samples: [] }, extra || {}))
+  });
 
-  window.module = { exports: {} };
-  window.eval(SOURCE);
-  const api = window.module.exports;
-
-  const K_STATS = "bili_fast_cdn.redirect.v1";
-  const DEFAULT_HOST = "upos-sz-mirrorali.bilivideo.com";
-
-  // Runs the script the way Surge would. $httpClient throws on purpose: this
-  // backend never makes a request of its own (no probing, no speed test).
-  function runSurge(globals) {
+  // Runs one script the way Surge would.
+  function runSurge(src, globals) {
     return new Promise((resolve, reject) => {
       const store = Object.assign({}, globals.store || {});
-      const run = { store, logs: [], donePayload: null, doneCount: 0 };
-
+      const run = { store, logs: [], notifications: [], httpCalls: [], donePayload: null, doneCount: 0 };
       window.$persistentStore = {
         read: (k) => (Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null),
         write: (v, k) => { store[k] = String(v); return true; }
       };
-      window.$httpClient = { get: () => { throw new Error("this backend must never issue requests"); } };
-      window.$notification = { post: () => { throw new Error("this backend must never notify"); } };
+      window.$notification = { post: (...a) => run.notifications.push(a) };
+      window.$httpClient = {
+        get: (opts, cb) => {
+          run.httpCalls.push(opts);
+          const spec = globals.http ? globals.http(opts) : { status: 500, data: "" };
+          const delay = spec.delay || 0;
+          setTimeout(() => {
+            clock.now += delay;
+            if (spec.error) cb(new Error("stub error"), null, null);
+            else cb(null, { status: spec.status, headers: spec.headers || {} }, spec.data);
+          }, 0);
+        }
+      };
       window.$done = (payload) => {
         run.doneCount += 1;
         run.donePayload = payload === undefined ? null : payload;
@@ -97,290 +113,374 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
       };
       window.$argument = globals.argument;
       window.console.log = (m) => run.logs.push(String(m));
-
-      if (globals.request) window.$request = globals.request; else delete window.$request;
-      if (globals.input) window.$input = globals.input; else delete window.$input;
-
-      try {
-        window.eval(SOURCE);
-      } catch (e) { reject(e); return; }
-      setTimeout(() => resolve(run), 2000);
+      ["$request", "$response", "$input", "$trigger", "$utils"].forEach((k) => {
+        const name = k.slice(1);
+        if (globals[name] !== undefined) window[k] = globals[name];
+        else delete window[k];
+      });
+      try { window.eval(src); } catch (e) { reject(e); return; }
+      setTimeout(() => resolve(run), 1500);
     });
   }
 
-  const asRequest = (url, argument, store) => runSurge({
-    request: { url, method: "GET" }, argument, store: store || {}
-  });
+  const asRequest = (url, argument, store) => runSurge(SRC_REQUEST,
+    { request: { url, method: "GET" }, argument, store });
+  const asResponse = (url, body, argument, store, headers, utils) => runSurge(SRC_PLAYURL,
+    { request: { url, method: "POST" }, response: { status: 200, headers: headers || {}, body },
+      argument, store, utils });
+  const asPanel = (argument, store, trigger, http) => runSurge(SRC_PROBE,
+    { input: { purpose: "panel", panelName: "BiliFastCDN" }, argument, store, trigger, http });
 
-  function hostOf(url) { const p = api.parseUrl(url); return p ? p.host : null; }
-  function portOf(url) { const p = api.parseUrl(url); return p ? p.port : null; }
-  function pathOf(url) { const p = api.parseUrl(url); return p ? p.path + p.query : null; }
+  // 测速轮的假网络：公开接口给一个样本，候选主机各自回一段 256KB 的"视频"。
+  const anyProbe = (opts) => {
+    if (opts.url.indexOf("/x/web-interface/popular") !== -1) {
+      return { status: 200, data: JSON.stringify({ data: { list: [{ bvid: "BV1abc", cid: 99 }] } }) };
+    }
+    if (opts.url.indexOf("/x/player/playurl") !== -1) {
+      return { status: 200, data: JSON.stringify({ data: { dash: { video: [{ baseUrl: "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1" }] } } }) };
+    }
+    return { status: 200, delay: 20, data: "x".repeat(262144) };
+  };
 
-  // ---- 1. url primitives -------------------------------------------------
+  const hostOf = (url) => (req.parseUrl(url) || {}).host;
+  const portOf = (url) => (req.parseUrl(url) || {}).port;
+
+  // ---- 1. url primitives --------------------------------------------------
 
   section("url primitives");
   {
-    const p = api.parseUrl("http://a.b.c:4483/upgcxcode/1.m4s?os=mcdn&x=1");
-    check("parseUrl scheme", p.scheme, "http");
-    check("parseUrl host", p.host, "a.b.c");
-    check("parseUrl port", p.port, "4483");
-    check("parseUrl path", p.path, "/upgcxcode/1.m4s");
-    check("parseUrl query", p.query, "?os=mcdn&x=1");
-    check("parseUrl on garbage", api.parseUrl("not a url"), null);
-    check("buildUrl without port", api.buildUrl("https", "h", "", "/p", "?q=1"), "https://h/p?q=1");
-    check("buildUrl with port", api.buildUrl("http", "h", "486", "/p", ""), "http://h:486/p");
-    check("queryParam decodes", api.queryParam("?a=1&xy_usource=upos-sz-mirrorhw.bilivideo.com", "xy_usource"),
+    const p = req.parseUrl("http://a.b.c:4483/upgcxcode/1.m4s?os=mcdn&x=1");
+    check("scheme", p.scheme, "http");
+    check("host", p.host, "a.b.c");
+    check("port", p.port, "4483");
+    check("path", p.path, "/upgcxcode/1.m4s");
+    check("query", p.query, "?os=mcdn&x=1");
+    check("garbage", req.parseUrl("not a url"), null);
+    check("buildUrl without port", req.buildUrl("https", "h", "", "/p", "?q=1"), "https://h/p?q=1");
+    check("queryParam decodes", req.queryParam("?a=1&xy_usource=upos-sz-mirrorhw.bilivideo.com", "xy_usource"),
       "upos-sz-mirrorhw.bilivideo.com");
-    check("queryParam decodes percent-encoded values", api.queryParam("?url=a%2Fb%3Fc%3D1", "url"), "a/b?c=1");
-    check("queryParam missing", api.queryParam("?a=1", "b"), null);
+    check("queryParam percent-decoding", req.queryParam("?url=a%2Fb%3Fc%3D1", "url"), "a/b?c=1");
   }
 
-  // ---- 2. configuration --------------------------------------------------
+  // ---- 2. auto resolution -------------------------------------------------
 
-  section("configuration");
+  section("auto resolution");
   {
-    const cfg = api.loadConfig();
-    check("Redirect's default targets", [cfg.hostOverseaVideo, cfg.hostBStar, cfg.hostPcdn],
-      [DEFAULT_HOST, DEFAULT_HOST, DEFAULT_HOST]);
-    check("Redirect's MCDN default", cfg.hostMcdn, "proxy-tf-all-ws.bilivideo.com");
-    check("debug defaults off", cfg.debug, false);
+    const cfgAuto = req.loadConfig();
+    check("the three categories default to auto", [cfgAuto.hostOverseaVideo, cfgAuto.hostBStar, cfgAuto.hostPcdn],
+      [req.DEFAULTS.hostOverseaVideo, req.DEFAULTS.hostBStar, req.DEFAULTS.hostPcdn]);
+    check("the mcdn target stays a fixed host", cfgAuto.hostMcdn, "proxy-tf-all-ws.bilivideo.com");
 
-    const over = await runSurge({ request: { url: "http://127.0.0.1:4480/x" },
-      argument: "hostOverseaVideo=upos-sz-mirrorhw.bilivideo.com&hostPcdn=upos-sz-mirrorcos.bilivideo.com&debug=true" });
-    check("an argument override reaches the panel", over.doneCount, 1);
-
-    window.$argument = "hostPcdn=https://upos-sz-mirrorcos.bilivideo.com:443/upgcxcode/";
-    const sanitised = api.loadConfig();
-    check("a pasted url is reduced to the host", sanitised.hostPcdn, "upos-sz-mirrorcos.bilivideo.com");
-
-    window.$argument = "host_oversea_video=upos-sz-mirrorhw.bilivideo.com";
-    check("snake_case aliases work", api.loadConfig().hostOverseaVideo, "upos-sz-mirrorhw.bilivideo.com");
-
+    window.$argument = "hostOverseaVideo=upos-sz-mirrorhw.bilivideo.com";
+    check("a fixed host wins over auto", req.resolveTarget(req.loadConfig(), "hostOverseaVideo"),
+      "upos-sz-mirrorhw.bilivideo.com");
+    window.$argument = "host_oversea=upos-sz-mirrorhw.bilivideo.com";
+    check("snake_case aliases reach the same field",
+      req.loadConfig().hostOverseaVideo, "upos-sz-mirrorhw.bilivideo.com");
     window.$argument = "hostOverseaVideo={{{hostOverseaVideo}}}";
-    check("an unsubstituted placeholder falls back to the default",
-      api.loadConfig().hostOverseaVideo, DEFAULT_HOST);
-
-    window.$argument = "debug=on";
-    check("debug accepts on", api.loadConfig().debug, true);
-    window.$argument = "debug=false";
-    check("debug accepts false", api.loadConfig().debug, false);
+    check("an unsubstituted placeholder falls back to auto", req.loadConfig().hostOverseaVideo, "auto");
+    window.$argument = "hostPcdn=https://upos-sz-mirrorcos.bilivideo.com:443/upgcxcode/";
+    check("a pasted url is reduced to the host", req.loadConfig().hostPcdn, "upos-sz-mirrorcos.bilivideo.com");
     window.$argument = "";
   }
 
-  // ---- 3. hostname categories (Redirect's switch) ------------------------
+  // ---- 3. rank drives auto ------------------------------------------------
 
-  section("hostname categories");
+  section("rank drives auto");
   {
-    const cfg = api.loadConfig();
-    const cases = [
-      // their fixed lists
-      ["upos-hz-mirrorakam.akamaized.net", "hostOverseaVideo", "oversea-video"],
-      ["upos-sz-mirrorakam.akamaized.net", "hostOverseaVideo", "oversea-video"],
-      ["upos-sz-mirrorawsov.bilivideo.com", "hostOverseaVideo", "oversea-video"],
-      ["upos-sz-mirroraliov.bilivideo.com", "hostOverseaVideo", "oversea-video"],
-      ["upos-sz-mirrorcosov.bilivideo.com", "hostOverseaVideo", "oversea-video"],
-      ["upos-sz-mirrorhwov.bilivideo.com", "hostOverseaVideo", "oversea-video"],
-      ["upos-sz-mirroralibstar1.bilivideo.com", "hostBStar", "bstar"],
-      ["upos-sz-mirrorcosbstar1.bilivideo.com", "hostBStar", "bstar"],
-      ["upos-sz-mirrorhwbstar1.bilivideo.com", "hostBStar", "bstar"],
-      ["upos-bstar1-mirrorakam.akamaized.net", "hostBStar", "bstar"],
-      // wildcard fallbacks
-      ["upos-sz-mirrorxxxxov.bilivideo.com", "hostOverseaVideo", "oversea-video"],
-      ["cn-hk-eq-01-01.bilivideo.com", "hostOverseaVideo", "oversea-video"],
-      ["upos-sz-mirrorweirdbstar1.bilivideo.com", "hostBStar", "bstar"]
-    ];
-    cases.forEach((c) => {
-      const r = api.classifyHost(cfg, c[0]);
-      check("category " + c[0], r && [r.host, r.reason], [cfg[c[1]], c[2]]);
-    });
+    const store = rankStore([RANK_A, "upos-sz-mirrorcosov.bilivideo.com"]);
+    const akam = await asRequest("http://upos-hz-mirrorakam.akamaized.net/upgcxcode/1/2/3.m4s?deadline=1&os=akam",
+      "", Object.assign({}, store));
+    check("akam goes to the fastest measured host", hostOf(akam.donePayload.url), RANK_A);
+    check("the query is preserved", req.parseUrl(akam.donePayload.url).query, "?deadline=1&os=akam");
 
-    // mainland mirrors are the targets themselves: never moved
-    api.MAINLAND_MIRRORS.forEach((h) => {
-      checkTrue("mainland mirror " + h + " is left alone", api.classifyHost(cfg, h) === null);
-    });
+    const mirror = await asRequest("http://upos-tf-all-tx.bilivideo.com/upgcxcode/x", "", Object.assign({}, store));
+    check("another mainland mirror also collapses onto the fastest", hostOf(mirror.donePayload.url), RANK_A);
+
+    const already = await asRequest("http://" + RANK_A + "/upgcxcode/x", "", Object.assign({}, store));
+    check("the fastest host itself is left alone (no loop)", already.donePayload, {});
+
+    const noRank = await asRequest("http://upos-hz-mirrorakam.akamaized.net/upgcxcode/x", "", {});
+    check("without a ranking it falls back to the bootstrap host",
+      hostOf(noRank.donePayload.url), req.resolveTarget(req.loadConfig(), "hostOverseaVideo"));
+    checkTrue("the fallback is a real mirror", /bilivideo\.com$/.test(req.resolveTarget(req.loadConfig(), "hostPcdn")));
+
+    const pinned = await asRequest("http://upos-hz-mirrorakam.akamaized.net/upgcxcode/x",
+      "hostOverseaVideo=upos-sz-mirrorhw.bilivideo.com", Object.assign({}, store));
+    check("a pinned host beats the ranking", hostOf(pinned.donePayload.url), "upos-sz-mirrorhw.bilivideo.com");
+
+    const pinnedPcdn = await asRequest("http://upos-sz-mirrorcos.bilivideo.com/upgcxcode/x",
+      "hostPcdn=upos-sz-mirrorcos.bilivideo.com", Object.assign({}, store));
+    check("with hostPcdn pinned, a mainland mirror stays put (upstream semantics)", pinnedPcdn.donePayload, {});
   }
 
-  // ---- 4. MCDN / PCDN port matrix ----------------------------------------
+  // ---- 4. MCDN / PCDN port matrix -----------------------------------------
 
   section("MCDN / PCDN");
   {
-    const cfg = api.loadConfig();
-    const expect = (name, url, expected) => {
-      const hit = api.rewriteRequest(url, cfg);
-      check(name, hit ? hit.url : null, expected);
+    const fixed = "hostOverseaVideo=upos-sz-mirrorali.bilivideo.com" +
+      "&hostBStar=upos-sz-mirrorali.bilivideo.com&hostPcdn=upos-sz-mirrorali.bilivideo.com";
+    const expect = async (name, url, expected) => {
+      const run = await asRequest(url, fixed, {});
+      check(name, run.donePayload.url || null, expected);
     };
-
-    // .mcdn.bilivideo.cn with no port: retarget the port by path + protocol
-    expect("mcdn http /v1/resource/ -> :8000",
+    await expect("mcdn no port, http /v1/resource/ -> :8000",
       "http://xy1x2x3x4xy.mcdn.bilivideo.cn/v1/resource/3.m4s?a=1",
       "http://xy1x2x3x4xy.mcdn.bilivideo.cn:8000/v1/resource/3.m4s?a=1");
-    expect("mcdn https /v1/resource/ -> :8082",
-      "https://xy1x2x3x4xy.mcdn.bilivideo.cn/v1/resource/3.m4s",
-      "https://xy1x2x3x4xy.mcdn.bilivideo.cn:8082/v1/resource/3.m4s");
-    expect("mcdn http /upgcxcode/ -> :9102",
-      "http://xy1x2x3x4xy.mcdn.bilivideo.cn/upgcxcode/3.m4s",
-      "http://xy1x2x3x4xy.mcdn.bilivideo.cn:9102/upgcxcode/3.m4s");
-    expect("mcdn https /upgcxcode/ -> :4483",
+    await expect("mcdn no port, https /upgcxcode/ -> :4483",
       "https://xy1x2x3x4xy.mcdn.bilivideo.cn/upgcxcode/3.m4s",
       "https://xy1x2x3x4xy.mcdn.bilivideo.cn:4483/upgcxcode/3.m4s");
-    expect("mcdn with an unrelated path is left alone",
-      "http://xy1x2x3x4xy.mcdn.bilivideo.cn/other/x", null);
-
-    // :486 — cdn / sid
-    expect("mcdn :486 with cdn",
-      "http://x.mcdn.bilivideo.cn:486/upgcxcode/3.m4s?cdn=abc&x=1",
-      "http://d1--abc.bilivideo.com/upgcxcode/3.m4s?cdn=abc&x=1");
-    expect("mcdn :486 with sid",
+    await expect("mcdn :486 with cdn",
+      "http://x.mcdn.bilivideo.cn:486/upgcxcode/3.m4s?cdn=abc",
+      "http://d1--abc.bilivideo.com/upgcxcode/3.m4s?cdn=abc");
+    await expect("mcdn :486 with sid",
       "http://x.mcdn.bilivideo.cn:486/upgcxcode/3.m4s?sid=xyz",
       "http://xyz.bilivideo.com/upgcxcode/3.m4s?sid=xyz");
-    expect("mcdn :486 without cdn/sid is left alone",
-      "http://x.mcdn.bilivideo.cn:486/upgcxcode/3.m4s", null);
-
-    // :4483 / :9102 — proxy wrap
-    expect("mcdn :4483 is wrapped by the proxy host",
-      "http://x.mcdn.bilivideo.cn:4483/upgcxcode/3.m4s?trid=1",
-      "http://proxy-tf-all-ws.bilivideo.com/?url=" +
-      encodeURIComponent("http://x.mcdn.bilivideo.cn:4483/upgcxcode/3.m4s?trid=1"));
-    expect("mcdn :9102 is wrapped too",
-      "http://x.mcdn.bilivideo.cn:9102/upgcxcode/3.m4s",
-      "http://proxy-tf-all-ws.bilivideo.com/?url=" +
-      encodeURIComponent("http://x.mcdn.bilivideo.cn:9102/upgcxcode/3.m4s"));
-    expect("a .bilivideo.com host on :4483 is skipped",
-      "http://x.bilivideo.com:4483/upgcxcode/3.m4s", null);
-    expect("an already wrapped url is skipped (no loop)",
+    await expect("mcdn :4483 is wrapped by the proxy",
+      "http://x.mcdn.bilivideo.cn:4483/upgcxcode/3.m4s",
+      "http://proxy-tf-all-ws.bilivideo.com/?url=" + encodeURIComponent("http://x.mcdn.bilivideo.cn:4483/upgcxcode/3.m4s"));
+    await expect("pcdn :4480 returns to xy_usource",
+      "https://1.2.3.4:4480/upgcxcode/3.m4s?xy_usource=upos-sz-mirrorhw.bilivideo.com",
+      "http://upos-sz-mirrorhw.bilivideo.com/upgcxcode/3.m4s?xy_usource=upos-sz-mirrorhw.bilivideo.com");
+    await expect("pcdn :4480 without xy_usource falls back to hostPcdn",
+      "https://1.2.3.4:4480/upgcxcode/3.m4s", "http://upos-sz-mirrorali.bilivideo.com/upgcxcode/3.m4s");
+    await expect("pcdn :9305 takes the host from the path",
+      "http://1.2.3.4:9305/upos-sz-mirrorcos.bilivideo.com/upgcxcode/3.m4s",
+      "http://upos-sz-mirrorcos.bilivideo.com/upgcxcode/3.m4s");
+    await expect("already wrapped (:4483 with originalUrl) is skipped",
       "http://x.mcdn.bilivideo.cn:4483/upgcxcode/3.m4s?originalUrl=http%3A%2F%2Fa.b%2Fc", null);
-    expect("the resource form is left alone",
+    await expect("the resource form on :8000 is left alone",
       "http://x.mcdn.bilivideo.cn:8000/v1/resource/3.m4s", null);
-
-    // PCDN
-    expect("pcdn :4480 returns to xy_usource",
-      "https://1.2.3.4:4480/upgcxcode/3.m4s?xy_usource=upos-sz-mirrorhw.bilivideo.com&bw=1",
-      "http://upos-sz-mirrorhw.bilivideo.com/upgcxcode/3.m4s?xy_usource=upos-sz-mirrorhw.bilivideo.com&bw=1");
-    expect("pcdn :4480 without xy_usource falls back to the configured host",
-      "https://1.2.3.4:4480/upgcxcode/3.m4s",
-      "http://upos-sz-mirrorali.bilivideo.com/upgcxcode/3.m4s");
-    expect("pcdn :9305 takes the host from the first path segment",
-      "http://1.2.3.4:9305/upos-sz-mirrorcos.bilivideo.com/upgcxcode/3.m4s?x=1",
-      "http://upos-sz-mirrorcos.bilivideo.com/upgcxcode/3.m4s?x=1");
-
-    // host rules win over the port rules
-    expect("an *ov host on a port still goes to the oversea target",
-      "http://upos-sz-mirroraliov.bilivideo.com:4483/upgcxcode/3.m4s",
-      "http://upos-sz-mirrorali.bilivideo.com/upgcxcode/3.m4s");
-    // 大陆镜像就是"目标本身"：上游在 switch 里把它们 break 掉，端口分支也不会碰到它们。
-    expect("a mainland mirror on a port is left alone",
-      "http://upos-sz-mirrorali.bilivideo.com:80/upgcxcode/3.m4s", null);
+    await expect("mcdn :486 without cdn/sid is left alone",
+      "http://x.mcdn.bilivideo.cn:486/upgcxcode/3.m4s", null);
+    await expect("a non-media-request is not touched", "http://x.mcdn.bilivideo.cn:1/other", null);
   }
 
-  // ---- 5. the request role ------------------------------------------------
+  // ---- 5. request role counters + debug -----------------------------------
 
   section("request role");
   {
-    const rewritten = await asRequest("http://upos-hz-mirrorakam.akamaized.net/upgcxcode/1/2/3.m4s?deadline=1&os=akam",
-      "hostOverseaVideo=upos-sz-mirrorhw.bilivideo.com");
-    check("akam is redirected to the configured oversea target",
-      rewritten.donePayload.url, "http://upos-sz-mirrorhw.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&os=akam");
-    check("the signed query is preserved", pathOf(rewritten.donePayload.url),
-      "/upgcxcode/1/2/3.m4s?deadline=1&os=akam");
-
-    const untouched = await asRequest("http://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s", "");
-    check("a mainland mirror passes through", untouched.donePayload, {});
-
-    const stats = JSON.parse(rewritten.store[K_STATS]);
+    const run = await asRequest("http://upos-hz-mirrorakam.akamaized.net/upgcxcode/x", "", rankStore([RANK_A]));
+    const stats = JSON.parse(run.store[K_STATS]);
     check("a rewrite is counted", [stats.calls, stats.rewrites], [1, 1]);
-    check("the reason is recorded", stats.last.reason, "oversea-video");
-    check("the move is recorded", [stats.last.from, stats.last.to],
-      ["upos-hz-mirrorakam.akamaized.net", "upos-sz-mirrorhw.bilivideo.com"]);
+    check("the last move is recorded (with a readable reason)",
+      [stats.last.reason, stats.last.to], ["港澳台", RANK_A]);
 
-    const quiet = await asRequest("http://upos-hz-mirrorakam.akamaized.net/upgcxcode/x", "");
-    check("passing through is counted too", JSON.parse(quiet.store[K_STATS]).calls, 1);
-    check("but no debug line without debug", quiet.logs.length, 0);
-
-    const loud = await asRequest("http://upos-hz-mirrorakam.akamaized.net/upgcxcode/x", "debug=true");
-    check("debug logs the decision", loud.logs.length, 1);
-    checkTrue("the debug line names the reason and the move",
-      loud.logs[0].indexOf("oversea-video") !== -1 && loud.logs[0].indexOf(DEFAULT_HOST) !== -1);
-    checkTrue("debug lines stay short (Surge elides long ones)", loud.logs[0].length <= 120);
-    checkTrue("no signature material is logged",
-      loud.logs.every((l) => l.indexOf("deadline=") === -1 && l.indexOf("sign=") === -1));
-
-    // The app's HTTPDNS shape: the port carries the decision, so it works for an
-    // IP-literal request too.
-    const byIp = await asRequest("http://1.2.3.4:4480/upgcxcode/3.m4s?xy_usource=upos-sz-mirrorhw.bilivideo.com", "");
-    check("an ip-literal pcdn request is still routed by xy_usource",
-      byIp.donePayload.url, "http://upos-sz-mirrorhw.bilivideo.com/upgcxcode/3.m4s?xy_usource=upos-sz-mirrorhw.bilivideo.com");
-
-    const garbage = await asRequest("not a url", "");
-    check("a non-url passes through", garbage.donePayload, {});
+    const quiet = await asRequest("http://upos-hz-mirrorakam.akamaized.net/upgcxcode/x", "", rankStore([RANK_A]));
+    check("no debug line without debug", quiet.logs.length, 0);
+    const loud = await asRequest("http://upos-hz-mirrorakam.akamaized.net/upgcxcode/x", "debug=true", rankStore([RANK_A]));
+    check("one debug line with debug", loud.logs.length, 1);
+    checkTrue("it names the move", loud.logs[0].indexOf("oversea-video") !== -1 && loud.logs[0].indexOf(RANK_A) !== -1);
+    checkTrue("it stays short (Surge elides long lines)", loud.logs[0].length <= 120);
   }
 
-  // ---- 6. the panel role --------------------------------------------------
+  // ---- 6. playurl: JSON ---------------------------------------------------
 
-  section("panel role");
+  section("playurl JSON");
   {
-    const input = { purpose: "panel", position: "policy-selection", panelName: "BiliFastCDN" };
-    const idle = await runSurge({ input, argument: "hostMcdn=proxy-tf-all-ws.bilivideo.com" });
-    check("the panel title carries the version", idle.donePayload.title, "B站CDN v" + api.VERSION);
-    checkTrue("it shows the static target", idle.donePayload.content.indexOf("sz-mirrorali") !== -1);
-    checkTrue("it shows the script counters", idle.donePayload.content.indexOf("脚本 命中0 改写0") !== -1);
-    check("style is info before any rewrite", idle.donePayload.style, "info");
-    checkTrue("it explains that regular mirrors are handled by the static rules",
-      idle.donePayload.content.indexOf("静态规则") !== -1);
-
-    const busy = await runSurge({
-      input,
-      argument: "hostOverseaVideo=upos-sz-mirrorhw.bilivideo.com",
-      store: {
-        [K_STATS]: JSON.stringify({
-          calls: 9, rewrites: 4,
-          reasons: { "mcdn-port": 3, "pcdn-upsource": 1 },
-          last: { reason: "mcdn-port", from: "xy1x2x3x4xy.mcdn.bilivideo.cn",
-            to: "xy1x2x3x4xy.mcdn.bilivideo.cn:9102", at: clock.now }
-        })
+    const payload = JSON.stringify({
+      code: 0,
+      data: {
+        dash: { video: [{ baseUrl: "http://upos-hz-mirrorakam.akamaized.net/upgcxcode/1/2/3.m4s?deadline=1",
+          backupUrl: ["http://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1"] }] },
+        durl: [{ url: "http://upos-sz-mirroraliov.bilivideo.com/upgcxcode/9/8/7.m4s" }]
       }
     });
-    checkTrue("it shows the counters", busy.donePayload.content.indexOf("脚本 命中9 改写4") !== -1);
-    checkTrue("it shows the configured target", busy.donePayload.content.indexOf("sz-mirrorhw") !== -1);
-    checkTrue("it shows the last move with a readable reason",
-      busy.donePayload.content.indexOf("最近 MCDN换端口：") !== -1);
-    check("style turns good once something was rewritten", busy.donePayload.style, "good");
-    check("the panel makes no requests", busy.doneCount, 1);
+    const run = await asResponse("https://api.bilibili.com/pgc/player/web/playurl?x=1", payload, "", rankStore([RANK_A]));
+    const out = JSON.parse(run.donePayload.body);
+    check("base_url moves to the fastest host",
+      hostOf(out.data.dash.video[0].baseUrl), RANK_A);
+    check("a backup url of the same category moves too",
+      hostOf(out.data.dash.video[0].backupUrl[0]), RANK_A);
+    check("durl moves as well", hostOf(out.data.durl[0].url), RANK_A);
+    check("the signed query survives", req.parseUrl(out.data.dash.video[0].baseUrl).query, "?deadline=1");
+    check("three rewrites are counted", JSON.parse(run.store[K_STATS]).rewrites, 3);
+
+    const same = await asResponse("https://api.bilibili.com/x/player/playurl?x=1",
+      JSON.stringify({ data: { dash: { video: [{ baseUrl: "http://" + RANK_A + "/upgcxcode/1.m4s" }] } } }),
+      "", rankStore([RANK_A]));
+    check("a body already on the target is untouched", same.donePayload, {});
+
+    const other = await asResponse("https://api.bilibili.com/x/player/playurl?x=1",
+      JSON.stringify({ data: { list: [{ pic: "http://i0.hdslb.com/bfs/a.jpg" }] } }), "", rankStore([RANK_A]));
+    check("a body without media urls is untouched", other.donePayload, {});
+    check("but it is still counted as a call", JSON.parse(other.store[K_STATS]).calls, 1);
   }
 
-  // ---- 7. the module file matches the script ------------------------------
+  // ---- 7. playurl: gRPC ---------------------------------------------------
 
-  section("module file");
+  section("playurl gRPC");
   {
-    const moduleLines = MODULE.split("\n");
-    const rules = moduleLines.filter((l) => /^\^https?:/.test(l));
-    check("12 static rewrite rules (http + https for each family)", rules.length, 12);
-    checkTrue("they target the oversea parameter",
-      rules.every((l) => l.indexOf("{{{hostOverseaVideo}}}") !== -1 || l.indexOf("{{{hostBStar}}}") !== -1));
-    checkTrue("every rule uses the host-rewrite type", rules.every((l) => l.indexOf(" header") !== -1));
-    checkTrue("akam has its own rules", rules.some((l) => l.indexOf("upos-hz-mirrorakam") !== -1));
-    checkTrue("the stray ports are forced through the http engine",
-      /force-http-engine-hosts[\s\S]*\*:4480[\s\S]*\*:4483[\s\S]*\*:8000[\s\S]*\*:8082[\s\S]*\*:9102/.test(MODULE));
-    checkTrue("mcdn and pcdn are the only request scripts",
-      /BiliFastCDN-MCDN = type=http-request/.test(MODULE) && /BiliFastCDN-PCDN = type=http-request/.test(MODULE));
-    checkTrue("the panel script is generic", /BiliFastCDN-Panel = type=generic/.test(MODULE));
-    checkTrue("the panel section points at it", /script-name=BiliFastCDN-Panel/.test(MODULE));
-    checkTrue("mitm covers the rewrite targets", /\[MITM\][\s\S]*upos-sz-mirror\*\.bilivideo\.com/.test(MODULE));
+    const vint = (n) => { const o = []; let v = n; do { const b = v % 128; v = Math.floor(v / 128); o.push(v ? b + 128 : b); } while (v); return o; };
+    const ldf = (field, bytes) => [field << 3 | 2].concat(vint(bytes.length), bytes);
+    const sfield = (field, s) => ldf(field, Array.from(s).map((c) => c.charCodeAt(0)));
+    const urlOf = (h) => "http://" + h + "/upgcxcode/1/2/3.m4s?deadline=1";
+    const message = (host) => new Uint8Array([].concat(
+      sfield(1, "playurl-id"),
+      ldf(2, [].concat(sfield(1, urlOf(host)), sfield(3, "backup"))),
+      sfield(4, "tail")
+    ));
+    const be32 = (n) => [Math.floor(n / 16777216) % 256, Math.floor(n / 65536) % 256, Math.floor(n / 256) % 256, n % 256];
+    const frame = (bytes, flag) => new Uint8Array([].concat([flag || 0], be32(bytes.length), Array.from(bytes)));
+    const stringsOf = (buf) => {
+      const out = [];
+      (function walk(s, e) {
+        let p = s;
+        while (p < e) {
+          const t = readV(buf, p, e); if (!t) return;
+          p = t.n; const w = t.v & 7, f = t.v >> 3;
+          if (w === 0) { const x = readV(buf, p, e); if (!x) return; p = x.n; }
+          else if (w === 1) { if (p + 8 > e) return; p += 8; }
+          else if (w === 5) { if (p + 4 > e) return; p += 4; }
+          else if (w === 2) {
+            const l = readV(buf, p, e); if (!l) return; p = l.n;
+            const pe = p + l.v; if (pe > e) return;
+            const before = out.length; walk(p, pe);
+            if (out.length === before) { let str = ""; for (let i = p; i < pe; i++) str += String.fromCharCode(buf[i]); out.push(str); }
+            p = pe;
+          } else return;
+        }
+      })(0, buf.length);
+      return out;
+    };
+    function readV(buf, p, e) { let v = 0, sh = 0; while (p < e) { const b = buf[p++]; v += (b & 127) * Math.pow(2, sh); if (!(b & 128)) return { v, n: p }; sh += 7; if (sh > 63) return null; } return null; }
 
-    // no leftovers from the previous engine
-    ["grpcRewrite", "grpcGunzip", "mediaRewrite", "mcdnStrategy", "backupFanout",
-      "type=cron", "type=http-response", "enabled=", "mode="].forEach((token) => {
-      checkTrue("the old engine's " + token + " is gone", MODULE.indexOf(token) === -1);
+    const equal = await asResponse("https://grpc.biliapi.net/bilibili.app.playerunite.v1.Player/PlayViewUnite",
+      frame(message("upos-tf-all-tx.bilivideo.com"), 0), "", rankStore([RANK_A]));
+    checkTrue("a frame is rewritten", !!equal.donePayload.body);
+    check("the rewritten frame keeps flag 0", equal.donePayload.body[0], 0);
+    check("it parses back with the new host",
+      stringsOf(equal.donePayload.body.slice(5)),
+      ["playurl-id", urlOf(RANK_A), "backup", "tail"]);
+    check("an equal-length swap keeps the size",
+      equal.donePayload.body.length, frame(message("upos-tf-all-tx.bilivideo.com"), 0).length);
+
+    const grow = await asResponse("https://grpc.biliapi.net/bilibili.app.playerunite.v1.Player/PlayViewUnite",
+      frame(message("upos-hz-mirrorakam.akamaized.net"), 0), "", rankStore([RANK_A]));
+    check("a longer host grows by exactly the delta",
+      grow.donePayload.body.length - frame(message("upos-hz-mirrorakam.akamaized.net"), 0).length,
+      RANK_A.length - "upos-hz-mirrorakam.akamaized.net".length);
+    check("the resized frame still parses back",
+      stringsOf(grow.donePayload.body.slice(5)), ["playurl-id", urlOf(RANK_A), "backup", "tail"]);
+
+    // compressed frames: without $utils they stay byte-identical, with it they come back uncompressed
+    const gz = new Uint8Array([].concat([1], be32(7), [31, 139, 8, 0, 1, 2, 3]));
+    const noUtils = await asResponse("https://grpc.biliapi.net/x", gz, "", rankStore([RANK_A]));
+    check("a compressed frame is left alone without $utils", noUtils.donePayload, {});
+
+    const plain = message("upos-hz-mirrorakam.akamaized.net");
+    const withUtils = await asResponse("https://grpc.biliapi.net/x", gz, "", rankStore([RANK_A]),
+      {}, { ungzip: () => plain });
+    checkTrue("with $utils.ungzip it is rewritten", !!withUtils.donePayload.body);
+    check("and comes back as an uncompressed frame", withUtils.donePayload.body[0], 0);
+    check("with a correct length prefix", withUtils.donePayload.body.length, 5 + message(RANK_A).length);
+    check("the rewritten body parses back",
+      stringsOf(withUtils.donePayload.body.slice(5)), ["playurl-id", urlOf(RANK_A), "backup", "tail"]);
+    check("the uncompressed frame is counted",
+      JSON.parse(withUtils.store[K_STATS]).reasons["oversea-video"], 1);
+
+    const notProto = await asResponse("https://grpc.biliapi.net/x", new Uint8Array([7, 7, 7, 7, 7, 7]), "", rankStore([RANK_A]));
+    check("a body that is not a frame stream is left alone", notProto.donePayload, {});
+  }
+
+  // ---- 8. speed test + panel ----------------------------------------------
+
+  section("speed test and panel");
+  {
+    check("the pool is the upos mirror list", probe.CANDIDATE_POOL.length, 8);
+    check("akam is not in the pool (it 403s upos-signed samples)",
+      probe.CANDIDATE_POOL.some((h) => /akamaized/.test(h)), false);
+
+    const ranked = probe.rankSamples([
+      { host: "a", ok: true, mbps: 10, ms: 100 },
+      { host: "b", ok: false, mbps: 0, ms: 50 },
+      { host: "c", ok: true, mbps: 30, ms: 200 },
+      { host: "d", ok: true, mbps: 30, ms: 120 }
+    ]);
+    check("rejected hosts are dropped", ranked.length, 3);
+    check("sorted by throughput then latency", ranked.map((r) => r.host), ["d", "c", "a"]);
+    check("the swapped probe url keeps the signed query",
+      probe.swapHost("http://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/1.m4s?deadline=1", "upos-tf-all-hw.bilivideo.com"),
+      "http://upos-tf-all-hw.bilivideo.com/upgcxcode/1.m4s?deadline=1");
+    check("the sample finder picks a signed segment",
+      probe.findSample({ data: { dash: { video: [{ baseUrl: "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1" }] } } }),
+      "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1");
+    check("it skips mcdn urls",
+      probe.findSample({ url: "http://xy1x2x3x4xy.mcdn.bilivideo.cn:9102/upgcxcode/3.m4s" }), null);
+
+    const idle = await asPanel("notify=false", {});
+    check("the panel title carries the version", idle.donePayload.title, "B站CDN v" + VERSION);
+    checkTrue("it says nothing was measured yet", idle.donePayload.content.indexOf("尚未测速") !== -1);
+    check("style is info with no ranking", idle.donePayload.style, "info");
+    check("an idle panel makes no requests", idle.httpCalls.length, 0);
+
+    const stored = await asPanel("notify=false", Object.assign({}, rankStore([RANK_A, "upos-sz-mirrorcosov.bilivideo.com"]), {
+      [K_STATS]: JSON.stringify({ calls: 12, rewrites: 5, reasons: { "oversea-video": 5 },
+        last: { reason: "港澳台", from: "upos-hz-mirrorakam.akamaized.net", to: RANK_A, at: clock.now } })
+    }));
+    checkTrue("it names the fastest host", stored.donePayload.content.indexOf("tf-all-hw") !== -1);
+    checkTrue("it shows the counters", stored.donePayload.content.indexOf("命中12 改写5") !== -1);
+    checkTrue("it shows the last move", stored.donePayload.content.indexOf("最近 港澳台：") !== -1);
+    check("style is good once rewrites happened", stored.donePayload.style, "good");
+
+    const tapped = await asPanel("notify=false", {}, "button", anyProbe);
+    checkTrue("tapping refresh probes", tapped.httpCalls.length > 0);
+    checkTrue("it stored a ranking", !!tapped.store[K_RANK]);
+    checkTrue("it reports a measured rate", tapped.donePayload.content.indexOf("Mbps") !== -1);
+    checkTrue("the probe used seconds-scale timeouts",
+      tapped.httpCalls.every((o) => typeof o.timeout === "number" && o.timeout > 0 && o.timeout <= 30));
+    checkTrue("the probe asked for a bounded range",
+      tapped.httpCalls.some((o) => o.headers && o.headers.Range === "bytes=0-1048575"));
+  }
+
+  // ---- 9. the module files agree with the scripts --------------------------
+
+  section("modules");
+  {
+    const versioned = (mod) => mod.split("\n").filter((l) => l.indexOf("script-path=") !== -1);
+    check("the request module has three script entries", versioned(MOD_REQUEST).length, 3);
+    check("the playurl module has six script entries", versioned(MOD_PLAYURL).length, 6);
+    [["request", MOD_REQUEST], ["playurl", MOD_PLAYURL]].forEach((pair) => {
+      const paths = versioned(pair[1]);
+      checkTrue("every " + pair[0] + " script-path is versioned with the scripts' VERSION",
+        paths.every((l) => l.indexOf("?v=" + VERSION) !== -1));
+      checkTrue("the " + pair[0] + " module desc carries the version",
+        pair[1].indexOf("#!desc=v" + VERSION) !== -1);
+      checkTrue("the " + pair[0] + " module has a cron probe pointing at bili-speedtest.js",
+        /type=cron/.test(pair[1]) && /bili-speedtest\.js/.test(pair[1]));
+      checkTrue("the " + pair[0] + " panel reads the speedtest script",
+        /\[Panel\][\s\S]*script-name=BiliFastCDN-Panel/.test(pair[1]) &&
+        /BiliFastCDN-Panel = type=generic[\s\S]*bili-speedtest\.js/.test(pair[1]));
     });
 
-    // version discipline: desc == script ?v= == script's VERSION
-    checkTrue("the module desc carries the version", MODULE.indexOf("#!desc=v" + api.VERSION) !== -1);
-    const versioned = moduleLines.filter((l) => l.indexOf("script-path=") !== -1);
-    check("every script-path is versioned", versioned.length, 3);
-    checkTrue("every script-path uses the same version",
-      versioned.every((l) => l.indexOf("?v=" + api.VERSION) !== -1));
-    checkTrue("every request script gets the four targets",
-      versioned.every((l) => ["hostOverseaVideo", "hostBStar", "hostPcdn", "hostMcdn"]
-        .every((k) => l.indexOf(k + "={{{" + k + "}}}") !== -1)));
+    checkTrue("the request module points its rewriting entry at bili-cdn.js",
+      /BiliFastCDN-CDN = type=http-request[\s\S]*bili-cdn\.js/.test(MOD_REQUEST));
+    checkTrue("it forces the odd ports through the http engine",
+      /force-http-engine-hosts[\s\S]*\*:4480[\s\S]*\*:4483[\s\S]*\*:8000[\s\S]*\*:8082[\s\S]*\*:9102/.test(MOD_REQUEST));
+    checkTrue("its pattern covers mirrors, akam, mcdn and pcdn",
+      /pattern=\^https\?:/.test(MOD_REQUEST) && /mcdn/.test(MOD_REQUEST) &&
+      /4480/.test(MOD_REQUEST) && /akamaized/.test(MOD_REQUEST));
+    checkTrue("it passes the four targets to the script",
+      ["hostOverseaVideo", "hostBStar", "hostPcdn", "hostMcdn"]
+        .every((k) => MOD_REQUEST.indexOf(k + "={{{" + k + "}}}") !== -1));
+
+    ["PlayViewUnite", "PlayURL/PlayView", "pgc/player/(api|web)/playurl", "pgc/player/web/v2/playurl"]
+      .forEach((token) => {
+        checkTrue("the playurl module covers " + token, MOD_PLAYURL.indexOf(token) !== -1);
+      });
+    check("the gRPC entries buffer binary bodies",
+      (MOD_PLAYURL.match(/binary-body-mode=1/g) || []).length, 2);
+    checkTrue("the gRPC entries use the webview engine (as the beta module does)",
+      (MOD_PLAYURL.match(/engine=webview/g) || []).length >= 2);
+    checkTrue("the playurl module mitms the API hosts",
+      /\[MITM\][\s\S]*grpc\.biliapi\.net/.test(MOD_PLAYURL) && /app\.bilibili\.com/.test(MOD_PLAYURL));
+
+    // no leftovers from the previous engines
+    ["grpcGunzip", "mediaRewrite", "mcdnStrategy", "backupFanout", "enabled=", "hostOversea=", "hostAkamai"]
+      .forEach((token) => {
+        checkTrue("no leftover " + token + " in either module",
+          MOD_REQUEST.indexOf(token) === -1 && MOD_PLAYURL.indexOf(token) === -1);
+      });
   }
 
   render(true);
