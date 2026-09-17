@@ -17,7 +17,7 @@ Surge iOS 模块：劫持 B 站 `playurl` / 直播 `playinfo` 接口，把视频
   字节级 protobuf 改写器为本项目自写，未复制其代码
 - 完整署名与上游许可全文：[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
 
-**真机验证范围。** 脚本逻辑有 291 项离线断言覆盖（含与上游逐条对照与合成 protobuf fixture）。
+**真机验证范围。** 脚本逻辑有 292 项离线断言覆盖（含与上游逐条对照与合成 protobuf fixture）。
 已在真机确认：模块安装、`[Panel]` 段落、明文 http 分片改写可用（把 Akamai 分片换到 `upos-sz-mirroraliov` 后播放正常）。
 gRPC 层真机已确认一半：**默认引擎确实交付了 Uint8Array body**（真机 `gRPC 触发 13 次`），
 但当时 `改写 0 次` —— 根因是 body 是 gRPC **帧**序列而非裸 protobuf，解析器在第一个字节（压缩标志位）就放弃了，
@@ -58,7 +58,7 @@ Surge（接口/Grpc 层需要 MitM，分片层不需要）
 | --- | --- |
 | `BiliFastCDN.sgmodule` | 模块本体：`[Script]` / `[Panel]` / `[MITM]` / 参数表 |
 | `bili-cdn.js` | 一个文件四种角色：接口改写 / 分片改写 / 测速 / 面板，按运行上下文分派 |
-| `test/verify.html` | 离线验证套件，291 项断言，用浏览器跑 |
+| `test/verify.html` | 离线验证套件，292 项断言，用浏览器跑 |
 | `LICENSE` | MIT |
 | `THIRD-PARTY-NOTICES.md` | 上游 realzza/bilibili-accelerator 的 MIT 署名 |
 
@@ -88,10 +88,18 @@ Surge（接口/Grpc 层需要 MitM，分片层不需要）
 目标 sz-mirroraliov · 72.3 Mbps
 测速 1 分钟前 · 8 个节点
 接口 触发12 媒体9 改写27
-gRPC 扫描23 改写21
+gRPC 扫描23 改写21 · 最近 41KB 帧1 改写21
 分片 扫描156 改写150
 最近 gRPC替换：hz-mirrorakam → sz-mirroraliov
 ```
+
+gRPC 那行尾巴是最近一次的**帧结构**，改写为 0 时靠它定位（不必翻日志）：
+
+| 尾巴里出现 | 含义 |
+| --- | --- |
+| `压缩N` | 有 N 个压缩帧（通常是 gzip），替换后无法重新压缩，只能放行 |
+| `非帧` | body 不是 gRPC 帧结构（可能不是本模块该管的响应） |
+| 都没有、且 `改写0` | 真的没有可换的主机名（例如 URL 用的是裸 IP 形式的 PCDN 节点） |
 
 三层计数分开计就是为了定位问题：
 
@@ -106,11 +114,13 @@ gRPC 扫描23 改写21
 
 点卡片右上角刷新按钮 = **立即重测**，不用等 30 分钟的定时任务。面板自身刷新（含自动刷新）只读已存结果，不发请求。
 
-**看 debug 输出。** 打开 `debug` 后有两处落点：
+**看 debug 输出。** 先看上面的面板 —— 三层计数与 gRPC 帧结构已经在那里，
+最常问的「为什么改写是 0」不用翻日志。要更细的逐条判定，打开 `debug` 后有三处落点：
 
-1. **请求详情里的注释**（iOS 上最好找）：模块的 `[Script]` 行带了 `debug`，Surge 会把 `console.log` 放进该请求的注释。
-   到「请求记录」点开任意一条 playurl 或分片请求就能看到。
-2. **日志页面**：需要 `[General] loglevel = info`。该值默认为 `notify`，脚本输出会被过滤掉
+1. **面板**（不依赖任何设置，永远可用）
+2. **请求详情里的注释**：模块的 `[Script]` 行带了 `debug`，Surge 会把 `console.log` 放进该请求的注释。
+   到「请求记录」点开对应的 playurl / gRPC / 分片请求即可看到。
+3. **日志页面**：需要 `[General] loglevel = info`。该值默认为 `notify`，**脚本输出会被这一级过滤掉**
    （`verbose` 没必要，官方说明它会明显影响性能）。
 
 ```
