@@ -205,7 +205,11 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
 
     const cfg = api.loadConfig();
     check("default mode", cfg.mode, "smart");
-    check("default mcdn strategy", cfg.mcdnStrategy, "replace");
+    // 两个上游项目都默认把 MCDN 走代理包裹，本模块跟随
+    check("default mcdn strategy is the proxy wrap", cfg.mcdnStrategy, "proxy");
+    check("the default mcdn target is the proxy host", cfg.hostMcdn, "proxy-tf-all-ws.bilivideo.com");
+    check("category targets default to auto", [cfg.hostPcdn, cfg.hostOversea, cfg.hostBStar],
+      ["auto", "auto", "auto"]);
     check("default notify", cfg.notify, true);
     check("default rank ttl", cfg.rankTtlMs, 6 * 60 * 60 * 1000);
     check("unknown mode falls back", api.loadConfig().mode, "smart");
@@ -419,8 +423,9 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
 
     check("primary moved to the fastest host", hostOf(video.baseUrl), TARGET);
     check("the signed tail survived", tailOf(video.baseUrl), tailOf(V_URL));
-    check("mcdn audio moved to the fastest host", hostOf(audio.baseUrl), TARGET);
-    check("the audio tail survived", tailOf(audio.baseUrl), tailOf(A_URL));
+    check("mcdn audio went through the proxy wrap", hostOf(audio.baseUrl), "proxy-tf-all-ws.bilivideo.com");
+    check("the proxied audio carries the original url verbatim",
+      decodeURIComponent(tailOf(audio.baseUrl).replace("/?url=", "")), A_URL);
     check("durl moved in force mode", hostOf(out.data.durl[0].url), TARGET);
     check("the durl tail survived", tailOf(out.data.durl[0].url), tailOf(D_URL));
     checkTrue("backups were fanned out", Array.isArray(video.backupUrl) && video.backupUrl.length > 1);
@@ -450,7 +455,9 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     const softOut = JSON.parse(soft.donePayload.body);
     check("bad-only leaves a healthy host alone",
       hostOf(softOut.data.dash.video[0].baseUrl), "upos-sz-mirrorcos.bilivideo.com");
-    check("bad-only still moves the pcdn host", hostOf(softOut.data.dash.audio[0].baseUrl), TARGET);
+    // MCDN 默认走代理包裹（两个上游项目都这么默认），所以目标是代理主机而不是测速最快
+    check("bad-only still moves the mcdn host, via the proxy by default",
+      hostOf(softOut.data.dash.audio[0].baseUrl), "proxy-tf-all-ws.bilivideo.com");
 
     // smart is the default mode: once there is a measured ranking it must move even
     // a healthy host, otherwise "redirect to the fastest CDN" never happens.
@@ -478,8 +485,8 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     const coldOut = JSON.parse(smartCold.donePayload.body);
     check("smart leaves a healthy host alone before the first test",
       hostOf(coldOut.data.dash.video[0].baseUrl), "upos-sz-mirrorcos.bilivideo.com");
-    check("the pcdn host falls back to the default before the first test",
-      hostOf(coldOut.data.dash.audio[0].baseUrl), "upos-sz-mirrorcosov.bilivideo.com");
+    check("the mcdn host is proxied before the first test",
+      hostOf(coldOut.data.dash.audio[0].baseUrl), "proxy-tf-all-ws.bilivideo.com");
 
     // A host Bilibili picked that is not a PCDN node is not ours to move.
     const CLEAN_URL = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/1.m4s?deadline=1";
@@ -677,8 +684,35 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     const coldAkam = await asRequest(AKAM, "mode=smart", {});
     check("akamai is left alone before the first measurement", coldAkam.donePayload, {});
     const coldMcdn = await asRequest(MCDN, "mode=smart", {});
-    check("an mcdn segment still moves before the first measurement",
-      hostOf(coldMcdn.donePayload.url), "upos-sz-mirrorcosov.bilivideo.com");
+    check("an mcdn segment is proxied even before the first measurement",
+      hostOf(coldMcdn.donePayload.url), "proxy-tf-all-ws.bilivideo.com");
+    const mcdnBest = await asRequest(MCDN, "mode=smart&mcdnStrategy=replace", Object.assign({}, rankStore));
+    check("mcdnStrategy=replace swaps mcdn to the measured best instead",
+      hostOf(mcdnBest.donePayload.url), TARGET);
+
+    // 分类目标覆盖：auto 用测速最快，填了主机名就固定用它。分类条件对齐 Redirect。
+    check("category: an *ov mirror is oversea",
+      api.categoryOf("upos-sz-mirrorcosov.bilivideo.com"), "oversea");
+    check("category: a cn-hk-eq node is oversea",
+      api.categoryOf("cn-hk-eq-01.bilivideo.com"), "oversea");
+    check("category: a bstar1 host is bstar",
+      api.categoryOf("upos-sz-mirrorhw.bstar1.bilivideo.com"), "bstar");
+    check("category: a plain mirror is pcdn",
+      api.categoryOf("upos-sz-mirrorcos.bilivideo.com"), "pcdn");
+
+    const OV = "http://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&sign=abc";
+    const ovAuto = await asRequest(OV, "mode=smart", Object.assign({}, rankStore));
+    check("an oversea host follows the ranking by default", hostOf(ovAuto.donePayload.url), TARGET);
+    const ovPin = await asRequest(OV, "mode=smart&hostOversea=upos-hw.bilivideo.com",
+      Object.assign({}, rankStore));
+    check("a pinned oversea target overrides the ranking",
+      hostOf(ovPin.donePayload.url), "upos-hw.bilivideo.com");
+
+    const BS = "http://upos-sz-mirrorhw.bstar1.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&sign=abc";
+    const bsPin = await asRequest(BS, "mode=smart&hostBStar=upos-hw.bilivideo.com",
+      Object.assign({}, rankStore));
+    check("a pinned bstar target overrides the ranking",
+      hostOf(bsPin.donePayload.url), "upos-hw.bilivideo.com");
 
     const notMedia = await asRequest(
       "http://upos-sz-mirrorcos.bilivideo.com/api/ping", "mode=smart", Object.assign({}, rankStore));

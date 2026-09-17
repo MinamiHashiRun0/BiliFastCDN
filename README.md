@@ -13,11 +13,12 @@ Surge iOS 模块：劫持 B 站 `playurl` / 直播 `playinfo` 接口，把视频
 - 参考项目：[realzza/bilibili-accelerator](https://github.com/realzza/bilibili-accelerator)（MIT）
 - 参考版本：`bilibili-accelerator.user.js` v0.4.1
 - 移植范围：CDN 主机分类判定、候选节点池、直播 `url_info` 过滤、`backupUrl` 扇出、force / bad-only 语义、`/live-bvc/` 排除规则、明文 http 分片改写
-- gRPC 拦截方式参考 [Biliverse/Redirect](https://github.com/Biliverse/Redirect)（Apache-2.0）的做法（`binary-body-mode` + gRPC 方法名 pattern）；
-  字节级 protobuf 改写器为本项目自写，未复制其代码
+- 参考 [Biliverse/Redirect](https://github.com/Biliverse/Redirect)（Apache-2.0）两处做法：`binary-body-mode` + gRPC 方法名 pattern 的拦截方式，
+  以及按来源主机名分类的判定条件（`*ov` / `cn-hk-eq-*` → 港澳台，`*bstar1` → 国际版）；
+  **字节级 protobuf 改写器与全部判定实现均为本项目自写，未复制其代码**
 - 完整署名与上游许可全文：[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
 
-**真机验证范围。** 脚本逻辑有 292 项离线断言覆盖（含与上游逐条对照与合成 protobuf fixture）。
+**真机验证范围。** 脚本逻辑有 302 项离线断言覆盖（含与上游逐条对照与合成 protobuf fixture）。
 已在真机确认：模块安装、`[Panel]` 段落、明文 http 分片改写可用（把 Akamai 分片换到 `upos-sz-mirroraliov` 后播放正常）。
 gRPC 层真机已确认一半：**默认引擎确实交付了 Uint8Array body**（真机 `gRPC 触发 13 次`），
 但当时 `改写 0 次` —— 根因是 body 是 gRPC **帧**序列而非裸 protobuf，解析器在第一个字节（压缩标志位）就放弃了，
@@ -58,7 +59,7 @@ Surge（接口/Grpc 层需要 MitM，分片层不需要）
 | --- | --- |
 | `BiliFastCDN.sgmodule` | 模块本体：`[Script]` / `[Panel]` / `[MITM]` / 参数表 |
 | `bili-cdn.js` | 一个文件四种角色：接口改写 / 分片改写 / 测速 / 面板，按运行上下文分派 |
-| `test/verify.html` | 离线验证套件，292 项断言，用浏览器跑 |
+| `test/verify.html` | 离线验证套件，302 项断言，用浏览器跑 |
 | `LICENSE` | MIT |
 | `THIRD-PARTY-NOTICES.md` | 上游 realzza/bilibili-accelerator 的 MIT 署名 |
 
@@ -72,6 +73,8 @@ Surge（接口/Grpc 层需要 MitM，分片层不需要）
 | `mode` | `smart` | `smart` 有测速结果时全量改写、无结果时只动劣质节点；`force` 总是改写；`bad-only` 只改写 PCDN / 劣质节点；`off` 关闭改写 |
 | `grpcRewrite` | `true` | 是否启用 gRPC（protobuf）响应改写 |
 | `mediaRewrite` | `true` | 是否启用明文 http 分片改写（官方 App 只有这层覆盖得到） |
+| `hostPcdn` / `hostOversea` / `hostBStar` | `auto` | 分类目标覆盖。`auto` = 用测速排名第一；填主机名则固定用它。分类按**来源主机名**判定：`upos-sz-mirror*ov` 与 `cn-hk-eq-*` 属港澳台，`*bstar1` 属国际版，其余按大陆 |
+| `hostMcdn` | `proxy-tf-all-ws.bilivideo.com` | MCDN 的目标节点（默认代理包裹，与 realzza、Biliverse/Redirect 两者的默认一致） |
 | `backupFanout` | `true` | 把候选节点写进 `backupUrl`，让播放器自己也能容错切换 |
 | `liveFilter` | `true` | 从直播 `url_info` 中剔除 PCDN 节点 |
 | `notify` | `true` | 测速完成后发通知 |
@@ -79,6 +82,7 @@ Surge（接口/Grpc 层需要 MitM，分片层不需要）
 
 改 `bili-cdn.js` 顶部常量还能调：候选节点池 `CANDIDATE_POOL`（按自己地区增删）、
 `DEFAULTS` 里的测速有效期 / 样本有效期 / 探测超时与字节数。测速频率改模块里的 `cronexp`。
+`mcdnStrategy`（`proxy` 代理包裹 / `replace` 换 host / `off`）也只在 `DEFAULTS` 里，不在参数表。
 
 ## 怎么确认生效
 

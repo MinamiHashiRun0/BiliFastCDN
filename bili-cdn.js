@@ -11,7 +11,7 @@
   var K_STATS = "bili_fast_cdn.stats.v1";
 
   // Surge 对远程脚本默认缓存 86400 秒，面板标题带版本号才能确认设备上跑的是哪一版。
-  var VERSION = "0.1.6";
+  var VERSION = "0.1.7";
   var PANEL_TITLE = "B站CDN";
   var REASON_LABELS = {
     "force-host": "全量改写",
@@ -44,7 +44,14 @@
   var DEFAULTS = {
     enabled: true,
     mode: "smart",              // smart | force | bad-only | off
-    mcdnStrategy: "replace",    // replace | proxy | off
+    // MCDN 默认走代理包裹：realzza 与 Biliverse/Redirect 两个独立项目都这么默认，
+    // 目标都是 proxy-tf-all-ws。想换回直接换 host 就改成 replace。
+    mcdnStrategy: "proxy",      // replace | proxy | off
+    // 分类目标覆盖（对齐 Redirect 的 Host.* 分类）。auto = 用测速排名第一。
+    hostPcdn: "auto",
+    hostOversea: "auto",
+    hostBStar: "auto",
+    hostMcdn: MCDN_PROXY_HOST,
     liveFilter: true,
     backupFanout: true,
     rewriteAkamai: false,
@@ -66,6 +73,10 @@
     backup_fanout: "backupFanout",
     media_rewrite: "mediaRewrite",
     grpc_rewrite: "grpcRewrite",
+    host_pcdn: "hostPcdn",
+    host_oversea: "hostOversea",
+    host_bstar: "hostBStar",
+    host_mcdn: "hostMcdn",
     live_filter: "liveFilter",
     mcdn_strategy: "mcdnStrategy",
     port_heuristic: "portHeuristic",
@@ -123,6 +134,12 @@
     return fallback;
   }
 
+  function asHost(value, fallback) {
+    var v = typeof value === "string" ? value.trim() : "";
+    if (!v || v.indexOf("{{{") !== -1) return fallback;
+    return cleanHost(v) || fallback;
+  }
+
   function asNumber(value, fallback) {
     var n = parseFloat(value);
     return isFinite(n) && n > 0 ? n : fallback;
@@ -171,6 +188,10 @@
     cfg.backupFanout = asBool(cfg.backupFanout, DEFAULTS.backupFanout);
     cfg.mediaRewrite = asBool(cfg.mediaRewrite, DEFAULTS.mediaRewrite);
     cfg.grpcRewrite = asBool(cfg.grpcRewrite, DEFAULTS.grpcRewrite);
+    cfg.hostPcdn = asHost(cfg.hostPcdn, DEFAULTS.hostPcdn);
+    cfg.hostOversea = asHost(cfg.hostOversea, DEFAULTS.hostOversea);
+    cfg.hostBStar = asHost(cfg.hostBStar, DEFAULTS.hostBStar);
+    cfg.hostMcdn = asHost(cfg.hostMcdn, DEFAULTS.hostMcdn);
     cfg.rewriteAkamai = asBool(cfg.rewriteAkamai, DEFAULTS.rewriteAkamai);
     cfg.portHeuristic = asBool(cfg.portHeuristic, DEFAULTS.portHeuristic);
     cfg.rankTtlMs = asNumber(cfg.rankTtlMs, DEFAULTS.rankTtlMs);
@@ -364,8 +385,30 @@
     return ok;
   }
 
-  function proxyUrl(rawUrl, scheme) {
-    return (scheme || "https") + "://" + MCDN_PROXY_HOST + "/?url=" + encodeURIComponent(rawUrl);
+  function proxyUrl(rawUrl, host, scheme) {
+    return (scheme || "https") + "://" + cleanHost(host) + "/?url=" + encodeURIComponent(rawUrl);
+  }
+
+  // 分类按来源主机名判定，条件对齐 Biliverse/Redirect：*ov 与 cn-hk-eq-* 属港澳台、
+  // *bstar1 属国际版，其余按大陆处理。
+  function categoryOf(host) {
+    var h = cleanHost(host);
+    if (h.indexOf("upos-sz-mirror") === 0 && /ov\.bilivideo\.com$/.test(h)) return "oversea";
+    if (h.indexOf("cn-hk-eq-") === 0 && /\.bilivideo\.com$/.test(h)) return "oversea";
+    if (/bstar1\.bilivideo\.com$/.test(h)) return "bstar";
+    return "pcdn";
+  }
+
+  // 某个来源主机该换到哪：分类覆盖优先（auto 表示不覆盖），否则用测速排名第一。
+  function targetFor(cfg, rank, host) {
+    // MCDN 走代理包裹时，字节层只能换主机名（拿不到整条 URL），所以这里落到
+    // hostMcdn —— 与 Redirect 把 mcdn 主机名换成 proxy-tf-all-ws 的做法一致。
+    if (isMcdnHost(host) && cfg.mcdnStrategy === "proxy") return cleanHost(cfg.hostMcdn);
+    var category = categoryOf(host);
+    var override = category === "oversea" ? cfg.hostOversea
+      : (category === "bstar" ? cfg.hostBStar : cfg.hostPcdn);
+    if (override && override !== "auto") return override;
+    return bestHost(cfg, rank);
   }
 
   // smart: 有测速结果时按 force 处理，没有结果时只动劣质节点。
@@ -373,10 +416,11 @@
   function rewriteOne(rawUrl, cfg, rank) {
     if (!hasMediaSignal(rawUrl)) return null;
     var p = parseUrl(rawUrl);
-    if (!p || !isMediaPath(p) || isLivePath(p) || p.host === MCDN_PROXY_HOST) return null;
+    if (!p || !isMediaPath(p) || isLivePath(p)) return null;
+    if (p.host === cleanHost(cfg.hostMcdn)) return null;
 
     var v = classify(p, cfg);
-    var target = bestHost(cfg, rank);
+    var target = targetFor(cfg, rank, p.host);
     var forceAll = cfg.mode === "force" || (cfg.mode === "smart" && !!(rank && rank.ranking.length));
 
     // 已经是目标节点就直接放过：http-request 改写后 Surge 会拿新 URL 重跑脚本，
@@ -390,7 +434,7 @@
     }
     if (v.mcdn && cfg.mcdnStrategy !== "off") {
       if (cfg.mcdnStrategy === "proxy") {
-        return moved(proxyUrl(rawUrl, p.scheme), p.host, MCDN_PROXY_HOST, "mcdn-proxy");
+        return moved(proxyUrl(rawUrl, cfg.hostMcdn, p.scheme), p.host, cfg.hostMcdn, "mcdn-proxy");
       }
       return moved(swapHost(rawUrl, target, p.scheme), p.host, target, "mcdn-host");
     }
@@ -1032,7 +1076,7 @@
 
   // 只按主机名判定：protobuf 里我们能确认的只有主机名这一段，拿不到 query / 端口。
   function shouldMoveHost(host, cfg, rank) {
-    if (host === bestHost(cfg, rank)) return false;
+    if (host === targetFor(cfg, rank, host)) return false;
     var ranked = !!(rank && rank.ranking.length);
     var forceAll = cfg.mode === "force" || (cfg.mode === "smart" && ranked);
     if (isMcdnHost(host) && cfg.mcdnStrategy !== "off") return true;
@@ -1046,12 +1090,16 @@
   function swapHostsInBytes(buf, start, end, cfg, rank, stats) {
     var spans = hostSpans(buf, start, end);
     if (!spans.length) return null;
-    var target = bestHost(cfg, rank);
     var swaps = [];
     for (var i = 0; i < spans.length; i++) {
       var host = spanHost(buf, spans[i]);
       if (!shouldMoveHost(host, cfg, rank)) continue;
-      swaps.push({ start: spans[i].start, end: spans[i].end, host: host });
+      swaps.push({
+        start: spans[i].start,
+        end: spans[i].end,
+        host: host,
+        to: targetFor(cfg, rank, host)
+      });
     }
     if (!swaps.length) return null;
 
@@ -1060,11 +1108,11 @@
     for (i = 0; i < swaps.length; i++) {
       var sw = swaps[i];
       for (var j = cursor; j < sw.start; j++) out.push(buf[j]);
-      for (j = 0; j < target.length; j++) out.push(target.charCodeAt(j));
+      for (j = 0; j < sw.to.length; j++) out.push(sw.to.charCodeAt(j));
       cursor = sw.end;
       if (stats) {
         stats.grpcRewrites += 1;
-        stats.details.push({ reason: "grpc-host", from: sw.host, to: target });
+        stats.details.push({ reason: "grpc-host", from: sw.host, to: sw.to });
       }
     }
     for (j = cursor; j < end; j++) out.push(buf[j]);
@@ -1350,6 +1398,8 @@
       rewriteProto: rewriteProto,
       rewriteGrpcBody: rewriteGrpcBody,
       shouldMoveHost: shouldMoveHost,
+      categoryOf: categoryOf,
+      targetFor: targetFor,
       rankSamples: rankSamples,
       throughputMbps: throughputMbps,
       loadConfig: loadConfig,
