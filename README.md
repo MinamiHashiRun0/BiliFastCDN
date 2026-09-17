@@ -17,10 +17,11 @@ Surge iOS 模块：劫持 B 站 `playurl` / 直播 `playinfo` 接口，把视频
   字节级 protobuf 改写器为本项目自写，未复制其代码
 - 完整署名与上游许可全文：[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
 
-**真机验证范围。** 脚本逻辑有 278 项离线断言覆盖（含与上游逐条对照与合成 protobuf fixture）。
+**真机验证范围。** 脚本逻辑有 291 项离线断言覆盖（含与上游逐条对照与合成 protobuf fixture）。
 已在真机确认：模块安装、`[Panel]` 段落、明文 http 分片改写可用（把 Akamai 分片换到 `upos-sz-mirroraliov` 后播放正常）。
-**gRPC 层尚未经真机验证** —— protobuf 改写逻辑有离线测试兜底，但「Surge 是否真把 Uint8Array 交给默认引擎、
-改写后播放是否正常」必须在设备上确认；出问题可以单独关 `grpcRewrite`。
+gRPC 层真机已确认一半：**默认引擎确实交付了 Uint8Array body**（真机 `gRPC 触发 13 次`），
+但当时 `改写 0 次` —— 根因是 body 是 gRPC **帧**序列而非裸 protobuf，解析器在第一个字节（压缩标志位）就放弃了，
+v0.1.5 已修（见「已知限制」）。修正后的改写效果仍待真机确认；出问题可以单独关 `grpcRewrite`。
 
 ## 它做什么
 
@@ -57,7 +58,7 @@ Surge（接口/Grpc 层需要 MitM，分片层不需要）
 | --- | --- |
 | `BiliFastCDN.sgmodule` | 模块本体：`[Script]` / `[Panel]` / `[MITM]` / 参数表 |
 | `bili-cdn.js` | 一个文件四种角色：接口改写 / 分片改写 / 测速 / 面板，按运行上下文分派 |
-| `test/verify.html` | 离线验证套件，278 项断言，用浏览器跑 |
+| `test/verify.html` | 离线验证套件，291 项断言，用浏览器跑 |
 | `LICENSE` | MIT |
 | `THIRD-PARTY-NOTICES.md` | 上游 realzza/bilibili-accelerator 的 MIT 署名 |
 
@@ -141,8 +142,14 @@ gRPC 扫描23 改写21
 - **官方 App 的 playurl 是 gRPC**（`grpc.biliapi.net`，protobuf）。gRPC 层在**字节层**处理它：不解析 schema，
   递归走一遍 protobuf 结构，把 length-delimited 字段里的 CDN 主机名换掉并同步修正长度前缀。
   安全性质是「没有可换的主机名时输出与输入逐字节相同」，替换后还会重新校验一次能否解析，失败就整段放弃。
-- **gRPC 层的两个边界**：① 消息若被 gzip 压缩过，替换后无法重新压缩，只能原样放过（`debug` 日志会打 `gzip-skip`）；
-  ② 模块里那条 `max-size` 是缓冲上限，超过就整条跳过直接放行（iOS 上过大会占 NE 进程内存），默认 1MB 偏小，本模块设为 4MB。
+- **gRPC 的 body 是帧序列，不是裸 protobuf**：每帧 `1 字节压缩标志 + 4 字节大端长度 + 消息`。
+  必须按帧解析 —— 把整段当裸 message 的话第一字节（标志位）就会被判为非法 tag，一次都改不成（这个坑真机踩过：
+  `gRPC 触发 13 次 / 改写 0 次`）。
+- **gRPC 层的三个边界**：
+  ① 压缩帧（标志位非 0，通常是 gzip）替换后无法重新压缩，只能原样保留，`debug` 日志会打 `compressed=N`；
+  ② 模块里那条 `max-size` 是缓冲上限，超过就整条跳过直接放行（iOS 上过大会占 NE 进程内存），默认 1MB 偏小，本模块设为 4MB；
+  ③ 主机名锚点覆盖 `bilivideo.{com,cn,net}` / `akamaized.net` / 已知 PCDN 家族（`szbdyd.com`、`mountaintoys.cn` 等），
+  **裸 IP 形式的 PCDN 节点识别不了**（JSON 层可以，gRPC 层暂时没有）。
 - **gRPC 的 pattern 是按方法名收窄的**（`PlayViewUnite` / `PlayView` / `PlayConf` / `PlayURL`）。判定按 body 内容做、
   不按方法名写死，所以 B 站以后再把别的接口迁到 gRPC 时，只需把新方法名加进模块那条 pattern 即可。
 - **分片层没有 backupUrl 兜底**。接口层改写失败时播放器还能靠 `backupUrl` 换节点；分片层是逐个请求改写，
@@ -167,7 +174,9 @@ chrome --headless=new --disable-gpu --allow-file-access-from-files \
 - 签名 query 必须逐字节保留；分片改写必须保持原 scheme；日志不得出现 token
 - 改写幂等（Surge 会对改写后的 URL 重跑脚本）
 - protobuf 改写：等长替换不改动任何长度前缀、变长替换（32→33）精确修正嵌套长度、改写后可重新解析出同样的结构、
-  无可换主机／非 protobuf／gzip 三种情况一律逐字节原样放行
+  无可换主机／非 protobuf 三种情况一律逐字节原样放行
+- gRPC 帧：单帧／多帧都能改写、帧长度按新消息长度重算、压缩帧原样保留并计数、
+  截断的帧流不动、**裸 message 不会被误当成帧流**（这条是对真机 `13 次触发 0 次改写` 的回归）
 - `$httpClient` 超时必须是秒级（Surge 该 API 的单位是秒，写毫秒会静默挂死 cron）
 
 ## 许可证

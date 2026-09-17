@@ -11,7 +11,7 @@
   var K_STATS = "bili_fast_cdn.stats.v1";
 
   // Surge 对远程脚本默认缓存 86400 秒，面板标题带版本号才能确认设备上跑的是哪一版。
-  var VERSION = "0.1.4";
+  var VERSION = "0.1.5";
   var PANEL_TITLE = "B站CDN";
   var REASON_LABELS = {
     "force-host": "全量改写",
@@ -936,7 +936,10 @@
   // 另外替换后还会再校验一次能否解析，失败就整段放弃。
   // B 站在持续把 HTTP 接口迁到 gRPC，所以判定按内容做，不按方法名写死。
 
-  var PROTO_ANCHORS = [".bilivideo.com", ".bilivideo.cn", ".bilivideo.net", ".akamaized.net"];
+  var PROTO_ANCHORS = [
+    ".bilivideo.com", ".bilivideo.cn", ".bilivideo.net", ".akamaized.net",
+    ".szbdyd.com", ".mountaintoys.cn", ".nexusedgeio.com", ".ahdohpiechei.com"
+  ];
   var PROTO_MAX_DEPTH = 12;
 
   function isHostByte(c) {
@@ -1126,6 +1129,56 @@
     return result.out;
   }
 
+  // gRPC 的 body 不是裸 protobuf，而是帧序列：每帧 1 字节压缩标志 + 4 字节大端长度 + 消息。
+  // 直接当裸 message 解析的话，第一字节（标志位，通常 0）就被判为非法 tag，一次都改不成。
+  function int32Bytes(value) {
+    return [
+      Math.floor(value / 16777216) % 256,
+      Math.floor(value / 65536) % 256,
+      Math.floor(value / 256) % 256,
+      value % 256
+    ];
+  }
+
+  // 返回 { out, frames, compressed, framed }；out 为 null 表示无需改动或结构不可信。
+  function rewriteGrpcBody(buf, cfg, rank, stats) {
+    var pos = 0;
+    var segs = [];
+    var changed = false;
+    var frames = 0;
+    var compressed = 0;
+
+    while (pos + 5 <= buf.length) {
+      var flag = buf[pos];
+      var len = buf[pos + 1] * 16777216 + buf[pos + 2] * 65536 + buf[pos + 3] * 256 + buf[pos + 4];
+      var payEnd = pos + 5 + len;
+      if (payEnd > buf.length) break;          // 帧不完整：不做任何改动
+      frames += 1;
+
+      if (flag !== 0) {
+        // 压缩帧（通常是 gzip）：替换后无法重新压缩，原样保留这帧
+        compressed += 1;
+        for (var q = pos; q < payEnd; q++) segs.push(buf[q]);
+      } else {
+        var sub = walkMessage(buf, pos + 5, payEnd, cfg, rank, stats, 0);
+        if (sub.out) {
+          var nl = int32Bytes(sub.out.length);
+          segs.push(flag);
+          for (q = 0; q < 4; q++) segs.push(nl[q]);
+          for (q = 0; q < sub.out.length; q++) segs.push(sub.out[q]);
+          changed = true;
+        } else {
+          for (q = pos; q < payEnd; q++) segs.push(buf[q]);
+        }
+      }
+      pos = payEnd;
+    }
+
+    if (pos !== buf.length) return { out: null, frames: frames, compressed: compressed, framed: false };
+    if (!changed) return { out: null, frames: frames, compressed: compressed, framed: true };
+    return { out: new Uint8Array(segs), frames: frames, compressed: compressed, framed: true };
+  }
+
   function responseHeaders() {
     var out = {};
     var src = ($response && $response.headers) || {};
@@ -1155,17 +1208,20 @@
         var gstats = { count: 0, reasons: {}, details: [], signal: true, binary: true, grpcRewrites: 0 };
         var gRank = loadRank(cfg);
 
-        // gRPC 层的消息可能被 gzip 压过，替换后无法重新压缩，只能原样放过。
-        var gzipped = bytes.length > 2 && bytes[0] === 31 && bytes[1] === 139;
-        if (cfg.grpcRewrite && !gzipped) {
-          out = rewriteProto(bytes, cfg, gRank, gstats);
+        var gres = { out: null, frames: 0, compressed: 0, framed: false };
+        if (cfg.grpcRewrite) {
+          gres = rewriteGrpcBody(bytes, cfg, gRank, gstats);
+          out = gres.out;
         }
-        gstats.count = gstats.grpcRewrites;
+        if (gstats.grpcRewrites) gstats.count = gstats.grpcRewrites;
+        else if (gres.compressed) gstats.count = 0;
         recordResponse(cfg, gstats, false, gRank);
 
         if (cfg.debug) {
           log("grpc: " + reqUrl.split("?")[0] + " bytes=" + bytes.length +
-            (gzipped ? " gzip-skip" : "") + " rewrites=" + gstats.grpcRewrites);
+            " frames=" + gres.frames + (gres.compressed ? " compressed=" + gres.compressed : "") +
+            (gres.framed ? "" : " not-framed") +
+            " rewrites=" + gstats.grpcRewrites);
           for (var gi = 0; gi < gstats.details.length && gi < MAX_LOGGED_DETAILS; gi++) {
             log("  " + gstats.details[gi].from + " -> " + gstats.details[gi].to);
           }
@@ -1261,6 +1317,7 @@
       filterLiveUrlInfo: filterLiveUrlInfo,
       findSample: findSample,
       rewriteProto: rewriteProto,
+      rewriteGrpcBody: rewriteGrpcBody,
       shouldMoveHost: shouldMoveHost,
       rankSamples: rankSamples,
       throughputMbps: throughputMbps,
