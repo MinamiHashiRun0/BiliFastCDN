@@ -638,7 +638,64 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     check("an empty body counts no signal", JSON.parse(empty.store[K_STATS]).signals, 0);
   }
 
-  // ---- 9. panel role ------------------------------------------------------
+  // ---- 9. media layer (http-request) --------------------------------------
+
+  section("media layer");
+  {
+    // Shapes taken from a real device capture: the app's segments are plain http
+    // and land on Akamai, carrying the upos signature plus an Akamai hdnts token.
+    const AKAM = "http://upos-hz-mirrorakam.akamaized.net/upgcxcode/17/75/41787787517/41787787517-1-30232.m4s?deadline=1&os=akam&upsig=abc&hdnts=exp=1~hmac=x";
+    const MCDN = "http://xy1x2x3x4xy.mcdn.bilivideo.cn:486/v1/resource/3-1-30280.m4s?os=mcdn&deadline=1&sign=abc";
+    const rankStore = { [K_RANK]: JSON.stringify({ at: clock.now, via: "sample", ranking: [TARGET, "upos-sz-mirroraliov.bilivideo.com"], samples: [] }) };
+    const asRequest = (url, argument, store) => runSurge({
+      script: { type: "http-request" },
+      request: { url, method: "GET" },
+      argument,
+      store,
+      http: () => { throw new Error("the media layer must never probe"); }
+    });
+
+    // The app's playurl is gRPC so the payload layer never sees it, but its
+    // segments are plain http — this layer needs no MitM and is the only one that
+    // reaches the app at all.
+    const akam = await asRequest(AKAM, "mode=smart", Object.assign({}, rankStore));
+    check("a plain-http akamai segment moves to the ranked host", akam.donePayload.url,
+      AKAM.replace("upos-hz-mirrorakam.akamaized.net", TARGET));
+    check("the media rewrite keeps the http scheme",
+      api.parseUrl(akam.donePayload.url).scheme, "http");
+    check("the media rewrite keeps the signed query",
+      tailOf(akam.donePayload.url), tailOf(AKAM));
+    check("the media layer never probes", akam.httpCalls.length, 0);
+
+    // Feeding the result back must not rewrite again: Surge re-runs the script on
+    // the new URL, so a non-idempotent rule would loop.
+    const again = await asRequest(akam.donePayload.url, "mode=smart", Object.assign({}, rankStore));
+    check("the media rewrite is idempotent", again.donePayload, {});
+
+    // Before the first measurement it stays conservative: only pcdn/mcdn move, and
+    // Akamai is not one of those (rewriteAkamai defaults to false).
+    const coldAkam = await asRequest(AKAM, "mode=smart", {});
+    check("akamai is left alone before the first measurement", coldAkam.donePayload, {});
+    const coldMcdn = await asRequest(MCDN, "mode=smart", {});
+    check("an mcdn segment still moves before the first measurement",
+      hostOf(coldMcdn.donePayload.url), "upos-sz-mirrorcosov.bilivideo.com");
+
+    const notMedia = await asRequest(
+      "http://upos-sz-mirrorcos.bilivideo.com/api/ping", "mode=smart", Object.assign({}, rankStore));
+    check("a non-media request on a cdn host is left alone", notMedia.donePayload, {});
+
+    const offLayer = await asRequest(AKAM, "mode=smart&mediaRewrite=false", Object.assign({}, rankStore));
+    check("mediaRewrite=false disables the layer", offLayer.donePayload, {});
+
+    const counted = JSON.parse(akam.store[K_STATS]);
+    check("a media call is counted", counted.mediaCalls, 1);
+    check("a media rewrite is counted", counted.mediaRewrites, 1);
+    check("the media layer leaves the payload counters alone", counted.calls, 0);
+    check("the media rewrite becomes the last recorded move",
+      [counted.last.from, counted.last.to], ["upos-hz-mirrorakam.akamaized.net", TARGET]);
+  }
+
+  // ---- 10. panel role -----------------------------------------------------
 
   section("panel role");
   {
@@ -679,8 +736,8 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     checkTrue("it reports a measured rate", tapped.donePayload.content.indexOf("Mbps") !== -1);
     // Traffic has not been rewritten yet in this run, so it points at MitM.
     check("style is info before any rewrite", tapped.donePayload.style, "info");
-    checkTrue("it says the script never fired",
-      tapped.donePayload.content.indexOf("脚本未触发") !== -1);
+    checkTrue("it says no traffic arrived at all",
+      tapped.donePayload.content.indexOf("未收到任何流量") !== -1);
     checkTrue("and points at the MitM switch",
       tapped.donePayload.content.indexOf("MitM") !== -1);
 
@@ -690,7 +747,7 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
       argument: "mode=smart&notify=false",
       store: Object.assign({}, rankStore, {
         [K_STATS]: JSON.stringify({
-          calls: 12, signals: 9, rewrites: 27, liveDropped: 3,
+          calls: 12, signals: 9, rewrites: 27, liveDropped: 3, mediaCalls: 156, mediaRewrites: 150,
           last: { reason: "force-host", from: "upos-sz-mirrorcos.bilivideo.com", to: TARGET, at: clock.now },
           lastNotifyAt: 0
         })
@@ -698,8 +755,10 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
       http: () => { throw new Error("reporting must not probe"); }
     });
     check("style is good once rewrites happen", reported.donePayload.style, "good");
-    checkTrue("it shows the three counters",
-      reported.donePayload.content.indexOf("触发 12 次 · 含媒体 9 次 · 改写 27 处") !== -1);
+    checkTrue("it shows the payload layer counters",
+      reported.donePayload.content.indexOf("接口 触发 12 · 媒体 9 · 改写 27") !== -1);
+    checkTrue("it shows the media layer counters separately",
+      reported.donePayload.content.indexOf("分片 156 次 · 改写 150 处") !== -1);
     checkTrue("it shows the last move", reported.donePayload.content.indexOf("最近 全量改写：sz-mirrorcos → tf-all-hw") !== -1);
     checkTrue("it shows the live filtering", reported.donePayload.content.indexOf("直播剔除 3") !== -1);
     check("no requests when only reporting", reported.httpCalls.length, 0);
@@ -731,7 +790,7 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     checkTrue("it says the response had no media address",
       partial.donePayload.content.indexOf("没有媒体地址") !== -1);
     checkTrue("and does not blame MitM for it",
-      partial.donePayload.content.indexOf("脚本未触发") === -1);
+      partial.donePayload.content.indexOf("未收到任何流量") === -1);
 
     const offPanel = await runSurge({
       script: { type: "generic" }, input: panelInput, trigger: "button",
@@ -870,16 +929,7 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     checkTrue("an unrecognized script type still probes", renamed.httpCalls.length > 0);
     checkTrue("it stored a ranking", !!renamed.store[K_RANK]);
 
-    // Being attached as an http-request script would break browsing: Surge
-    // forbids async work before $done() in that context.
-    const asRequest = await runSurge({
-      script: { type: "http-request" },
-      request: { url: "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1.m4s" },
-      argument: "notify=false",
-      http: () => { throw new Error("must not probe from an http-request script"); }
-    });
-    check("refuses to run as an http-request script", asRequest.doneCount, 1);
-    check("no requests from an http-request script", asRequest.httpCalls.length, 0);
+    // The http-request role is exercised in the media layer section below.
 
     const offRun = await runSurge({
       script: { type: "cron" },
