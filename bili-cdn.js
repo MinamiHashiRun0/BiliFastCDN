@@ -268,6 +268,7 @@
       value.indexOf("nexusedgeio") !== -1 ||
       value.indexOf("ahdohpiechei") !== -1 ||
       value.indexOf("mcdn.bili") !== -1 ||
+      value.indexOf("acgvideo") !== -1 ||
       value.indexOf("os=mcdn") !== -1 ||
       value.indexOf("/upgcxcode/") !== -1 ||
       value.indexOf("/v1/resource/") !== -1;
@@ -564,7 +565,7 @@
   }
 
   function emptyStats() {
-    return { responses: 0, rewrites: 0, liveDropped: 0, last: null, lastNotifyAt: 0 };
+    return { calls: 0, signals: 0, rewrites: 0, liveDropped: 0, last: null, lastNotifyAt: 0 };
   }
 
   function loadStats() {
@@ -578,10 +579,13 @@
     return out;
   }
 
-  // 命中即计数（即使改写 0 处）：面板靠这个区分「没有流量」和「有流量但无需改写」。
+  // 每次调用都计数，且在读到响应体之前就计：calls / signals / rewrites 三个数字
+  // 分别对应「脚本没被触发」「触发了但响应体里没有媒体地址」「读到了但无需改写」，
+  // 只有第一个才是 MitM 没生效。
   function recordResponse(cfg, stats, isLive, rank) {
     var state = loadStats();
-    state.responses += 1;
+    state.calls += 1;
+    if (stats.signal) state.signals += 1;
     state.rewrites += stats.count;
     if (isLive) state.liveDropped += stats.count;
     if (stats.details.length) {
@@ -830,16 +834,19 @@
       lines.push(note ? note : "点刷新按钮立即测速");
     }
 
-    lines.push("命中 " + state.responses + " 次 · 改写 " + state.rewrites + " 处" +
-      (state.liveDropped ? " · 直播剔除 " + state.liveDropped : ""));
+    lines.push("触发 " + state.calls + " 次 · 含媒体 " + state.signals + " 次 · 改写 " +
+      state.rewrites + " 处" + (state.liveDropped ? " · 直播剔除 " + state.liveDropped : ""));
     if (state.last) {
       lines.push("最近 " + reasonLabel(state.last.reason) + "：" +
         shorten(state.last.from) + " → " + shorten(state.last.to));
     }
 
+    // 三个数字对应三种不同的故障，只有第一个是 MitM 没生效。混在一起报「命中 0 次」
+    // 时，用户无法区分自己该去查 MitM 还是该去查播放的客户端。
     if (state.rewrites > 0) style = "good";
-    else if (state.responses > 0) lines.push("有接口流量但无需改写");
-    else lines.push("未收到 playurl 流量：检查 MitM 开关");
+    else if (state.calls === 0) lines.push("脚本未触发：检查 MitM 列表与证书");
+    else if (state.signals === 0) lines.push("脚本已触发但响应里没有媒体地址");
+    else lines.push("有媒体地址但无需改写");
 
     done({ title: PANEL_TITLE, content: lines.join("\n"), style: style });
   }
@@ -859,48 +866,59 @@
     try {
       var body = $response && $response.body;
       var reqUrl = ($request && $request.url) || "";
+      var isLive = /getRoomPlayInfo/i.test(reqUrl);
+      var stats = { count: 0, reasons: {}, details: [], signal: false };
+      var parsed = null;
+      var rank = null;
+      var out = null;
 
       if (!cfg.enabled || cfg.mode === "off") return done();
-      if (typeof body !== "string" || !hasMediaSignal(body)) return done();
 
-      var parsed = safeParse(body);
-      if (!parsed) {
-        log("response: body is not JSON, left alone");
-        return done();
-      }
+      stats.signal = typeof body === "string" && hasMediaSignal(body);
+      if (stats.signal) parsed = safeParse(body);
 
-      var rank = loadRank(cfg);
-      var pool = poolForFanout(cfg, rank);
-      var stats = { count: 0, reasons: {}, details: [] };
-      var isLive = /getRoomPlayInfo/i.test(reqUrl);
+      if (parsed) {
+        rank = loadRank(cfg);
+        var pool = poolForFanout(cfg, rank);
 
-      if (isLive) {
-        if (cfg.liveFilter) {
-          var dropped = filterLiveUrlInfo(parsed, cfg, 0, new Set());
-          stats.count += dropped;
-          if (dropped) stats.reasons["live-filter"] = dropped;
+        if (isLive) {
+          if (cfg.liveFilter) {
+            var dropped = filterLiveUrlInfo(parsed, cfg, 0, new Set());
+            stats.count += dropped;
+            if (dropped) stats.reasons["live-filter"] = dropped;
+          }
+        } else {
+          var sample = findSample(parsed);
+          rewriteValue(parsed, cfg, rank, stats, 0, new Set());
+          if (cfg.backupFanout) stats.count += enrichBackups(parsed, pool);
+          if (sample) saveSample(sample);
         }
-      } else {
-        var sample = findSample(parsed);
-        rewriteValue(parsed, cfg, rank, stats, 0, new Set());
-        if (cfg.backupFanout) stats.count += enrichBackups(parsed, pool);
-        if (sample) saveSample(sample);
+
+        if (stats.count) out = JSON.stringify(parsed);
       }
 
       recordResponse(cfg, stats, isLive, rank);
 
       if (cfg.debug) {
-        log("response: " + reqUrl.split("?")[0] + " rewrites=" + stats.count +
-          " " + JSON.stringify(stats.reasons) + " target=" + bestHost(cfg, rank));
+        // reqUrl 在 ? 处截断：后面是带签名的 token。bytes/signal 用来判断到底是
+        // 脚本没被触发，还是触发了但拿到的不是媒体 JSON。
+        var line = "response: " + reqUrl.split("?")[0] +
+          " bytes=" + (typeof body === "string" ? body.length : "-") +
+          " signal=" + stats.signal;
+        if (parsed) {
+          line += " code=" + (parsed.code === undefined ? "-" : parsed.code) +
+            " rewrites=" + stats.count + " " + JSON.stringify(stats.reasons) +
+            " target=" + bestHost(cfg, rank);
+        }
+        log(line);
         for (var di = 0; di < stats.details.length; di++) {
           log("  " + stats.details[di].reason + " " + stats.details[di].from +
             " -> " + stats.details[di].to);
         }
       }
 
-      if (!stats.count) return done();
-
-      done({ body: JSON.stringify(parsed), headers: responseHeaders() });
+      if (out !== null) done({ body: out, headers: responseHeaders() });
+      else done();
     } catch (e) {
       log("response: failed, passing through (" + (e && e.message) + ")");
       done();

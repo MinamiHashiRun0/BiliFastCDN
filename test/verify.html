@@ -576,7 +576,8 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     });
     check("no notification without debug", quiet.notifications.length, 0);
     const qStats = JSON.parse(quiet.store[K_STATS] || "null");
-    check("a matched response is counted", qStats.responses, 1);
+    check("a matched response is counted", qStats.calls, 1);
+    check("a media-bearing response is counted", qStats.signals, 1);
     check("its rewrites are counted", qStats.rewrites, 2);
     check("the last rewrite records the move",
       [qStats.last.from, qStats.last.to], ["upos-sz-mirrorcos.bilivideo.com", TARGET]);
@@ -608,6 +609,33 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     });
     check("the rewrite notification is rate limited", burst.notifications.length, 0);
     check("but the counters still accumulate", JSON.parse(burst.store[K_STATS]).rewrites, 4);
+
+    // A response that reached the script but carries no media address (an api error,
+    // or an endpoint that is not playurl) must still be counted as a call. Without
+    // that, the panel cannot tell "the script never ran" from "it ran on the wrong
+    // response" — which is exactly the blind spot that made a device report useless.
+    const bare = await runSurge({
+      script: { type: "http-response" }, request,
+      response: { status: 200, headers: {}, body: JSON.stringify({ code: -404, message: "nothing here" }) },
+      argument: "mode=force&debug=true", store: Object.assign({}, rankStore)
+    });
+    const bStats = JSON.parse(bare.store[K_STATS]);
+    check("a non-media response still counts as a call", bStats.calls, 1);
+    check("but not as a media signal", bStats.signals, 0);
+    check("and nothing is rewritten", bStats.rewrites, 0);
+    check("it passes the body through untouched", bare.donePayload, {});
+    checkTrue("the debug line marks it as signal-less",
+      bare.logs.some((l) => l.indexOf("signal=false") !== -1));
+    checkTrue("the debug line records the body length",
+      bare.logs.some((l) => l.indexOf("bytes=") !== -1));
+
+    const empty = await runSurge({
+      script: { type: "http-response" }, request,
+      response: { status: 200, headers: {}, body: "" },
+      argument: "mode=force&debug=true", store: Object.assign({}, rankStore)
+    });
+    check("an empty body still counts as a call", JSON.parse(empty.store[K_STATS]).calls, 1);
+    check("an empty body counts no signal", JSON.parse(empty.store[K_STATS]).signals, 0);
   }
 
   // ---- 9. panel role ------------------------------------------------------
@@ -651,7 +679,9 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     checkTrue("it reports a measured rate", tapped.donePayload.content.indexOf("Mbps") !== -1);
     // Traffic has not been rewritten yet in this run, so it points at MitM.
     check("style is info before any rewrite", tapped.donePayload.style, "info");
-    checkTrue("it points at the MitM switch",
+    checkTrue("it says the script never fired",
+      tapped.donePayload.content.indexOf("脚本未触发") !== -1);
+    checkTrue("and points at the MitM switch",
       tapped.donePayload.content.indexOf("MitM") !== -1);
 
     // With rewrites on the record the panel turns green and shows the counters.
@@ -660,7 +690,7 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
       argument: "mode=smart&notify=false",
       store: Object.assign({}, rankStore, {
         [K_STATS]: JSON.stringify({
-          responses: 9, rewrites: 27, liveDropped: 3,
+          calls: 12, signals: 9, rewrites: 27, liveDropped: 3,
           last: { reason: "force-host", from: "upos-sz-mirrorcos.bilivideo.com", to: TARGET, at: clock.now },
           lastNotifyAt: 0
         })
@@ -668,7 +698,8 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
       http: () => { throw new Error("reporting must not probe"); }
     });
     check("style is good once rewrites happen", reported.donePayload.style, "good");
-    checkTrue("it shows the counters", reported.donePayload.content.indexOf("命中 9 次 · 改写 27 处") !== -1);
+    checkTrue("it shows the three counters",
+      reported.donePayload.content.indexOf("触发 12 次 · 含媒体 9 次 · 改写 27 处") !== -1);
     checkTrue("it shows the last move", reported.donePayload.content.indexOf("最近 全量改写：sz-mirrorcos → tf-all-hw") !== -1);
     checkTrue("it shows the live filtering", reported.donePayload.content.indexOf("直播剔除 3") !== -1);
     check("no requests when only reporting", reported.httpCalls.length, 0);
@@ -678,13 +709,29 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
       script: { type: "generic" }, input: panelInput, trigger: "auto-interval",
       argument: "mode=bad-only&notify=false",
       store: Object.assign({}, rankStore, {
-        [K_STATS]: JSON.stringify({ responses: 4, rewrites: 0, liveDropped: 0, last: null, lastNotifyAt: 0 })
+        [K_STATS]: JSON.stringify({ calls: 4, signals: 4, rewrites: 0, liveDropped: 0, last: null, lastNotifyAt: 0 })
       }),
       http: () => { throw new Error("reporting must not probe"); }
     });
     check("style stays info when nothing needed rewriting", noNeed.donePayload.style, "info");
     checkTrue("it explains that nothing needed rewriting",
       noNeed.donePayload.content.indexOf("无需改写") !== -1);
+
+    // Fired but the bodies carried no media address: a different fault from "never
+    // fired", and a different hint has to be shown.
+    const partial = await runSurge({
+      script: { type: "generic" }, input: panelInput, trigger: "auto-interval",
+      argument: "mode=smart&notify=false",
+      store: Object.assign({}, rankStore, {
+        [K_STATS]: JSON.stringify({ calls: 6, signals: 0, rewrites: 0, liveDropped: 0, last: null, lastNotifyAt: 0 })
+      }),
+      http: () => { throw new Error("reporting must not probe"); }
+    });
+    check("style stays info when bodies carried no media", partial.donePayload.style, "info");
+    checkTrue("it says the response had no media address",
+      partial.donePayload.content.indexOf("没有媒体地址") !== -1);
+    checkTrue("and does not blame MitM for it",
+      partial.donePayload.content.indexOf("脚本未触发") === -1);
 
     const offPanel = await runSurge({
       script: { type: "generic" }, input: panelInput, trigger: "button",
