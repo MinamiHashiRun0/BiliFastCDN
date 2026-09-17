@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 <你的名字>
+Copyright (c) 2026 MinamiHashiRun0
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -20,7 +20,3 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
----
-
-本项目包含移植自 bilibili-accelerator 的代码，其许可与版权声明见
-THIRD-PARTY-NOTICES.md，该声明须随本软件一并保留。

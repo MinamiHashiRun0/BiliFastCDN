@@ -39,8 +39,8 @@ Surge MitM（只覆盖 API 域名）
 | --- | --- |
 | `BiliFastCDN.sgmodule` | 模块本体：`[Script]` / `[Panel]` / `[MITM]` / 参数表 |
 | `bili-cdn.js` | 一个文件三种角色：改写 / 测速 / 面板，按运行上下文分派 |
-| `test/verify.html` | 离线验证套件，228 项断言，用浏览器跑 |
-| `LICENSE` | MIT（**把 `<你的名字>` 换成你自己**） |
+| `test/verify.html` | 离线验证套件，232 项断言，用浏览器跑 |
+| `LICENSE` | MIT |
 | `THIRD-PARTY-NOTICES.md` | 上游 realzza/bilibili-accelerator 的 MIT 署名 |
 
 ## 安装（iOS）
@@ -158,4 +158,4 @@ chrome --headless=new --disable-gpu --allow-file-access-from-files \
 3. Apache-2.0 同样兼容，额外附带专利授权，代价是多一套 NOTICE 机制；如果在意专利可选它。
 4. GPL 系虽然对 MIT 部分兼容，但会把整个组合作品拖入 copyleft，对一个 Surge 模块来说通常是给自己添麻烦。
 
-当前 `LICENSE` 是 MIT 占位版本，**请把 `<你的名字>` 换成你自己的名字或 ID**。
+`LICENSE` 已按 MIT 填写（版权人 MinamiHashiRun0，想换名字直接改）。该文件保持 MIT 标准全文，不要在其后追加内容 —— 否则 GitHub 无法识别许可证。
