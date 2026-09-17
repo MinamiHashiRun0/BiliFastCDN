@@ -9,11 +9,11 @@
 # 生效判断看策略页「B站CDN」卡片的两行计数：
 #   接口 触发/媒体/改写 = 网页版 playurl 那层（需要 MitM）
 #   分片 改写/总数      = 明文 http 分片那层（不需要 MitM，官方 App 只有这层覆盖得到）
-# 点卡片刷新按钮立即测速；debug 参数可把每次判定写进 Surge 日志。
+# 点卡片刷新按钮立即测速；debug 打开后判定会写进「请求详情 → 注释」，日志页需要 loglevel=info。
 
 [Script]
-BiliFastCDN-Rewrite = type=http-response,pattern=^https?://(api\.bilibili\.com|app\.bilibili\.com|api\.live\.bilibili\.com|api\.biliapi\.net|api\.snm0516\.aisee\.tv)/.*(playurl|getRoomPlayInfo),requires-body=1,max-size=10485760,timeout=20,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-cdn.js?v=0.1.3,script-update-interval=1800,argument=enabled={{{enabled}}}&mode={{{mode}}}&backupFanout={{{backupFanout}}}&liveFilter={{{liveFilter}}}&notify={{{notify}}}&debug={{{debug}}}
-BiliFastCDN-Media = type=http-request,pattern=^http://[a-zA-Z0-9.-]+\.(bilivideo\.(com|cn|net)|akamaized\.net)(:[0-9]+)?/,timeout=5,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-cdn.js?v=0.1.3,script-update-interval=1800,argument=enabled={{{enabled}}}&mode={{{mode}}}&mediaRewrite={{{mediaRewrite}}}&debug={{{debug}}}
+BiliFastCDN-Rewrite = type=http-response,pattern=^https?://(api\.bilibili\.com|app\.bilibili\.com|api\.live\.bilibili\.com|api\.biliapi\.net|api\.snm0516\.aisee\.tv)/.*(playurl|getRoomPlayInfo),requires-body=1,max-size=10485760,timeout=20,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-cdn.js?v=0.1.3,script-update-interval=1800,debug={{{debug}}},argument=enabled={{{enabled}}}&mode={{{mode}}}&backupFanout={{{backupFanout}}}&liveFilter={{{liveFilter}}}&notify={{{notify}}}&debug={{{debug}}}
+BiliFastCDN-Media = type=http-request,pattern=^http://[a-zA-Z0-9.-]+\.(bilivideo\.(com|cn|net)|akamaized\.net)(:[0-9]+)?/,timeout=5,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-cdn.js?v=0.1.3,script-update-interval=1800,debug={{{debug}}},argument=enabled={{{enabled}}}&mode={{{mode}}}&mediaRewrite={{{mediaRewrite}}}&debug={{{debug}}}
 BiliFastCDN-Probe = type=cron,cronexp="*/30 * * * *",timeout=60,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-cdn.js?v=0.1.3,script-update-interval=1800,argument=enabled={{{enabled}}}&mode={{{mode}}}&notify={{{notify}}}&debug={{{debug}}}
 BiliFastCDN-Panel = type=generic,timeout=30,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-cdn.js?v=0.1.3,script-update-interval=1800,argument=enabled={{{enabled}}}&mode={{{mode}}}&notify={{{notify}}}&debug={{{debug}}}
 

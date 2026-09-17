@@ -12,12 +12,10 @@ Surge iOS 模块：劫持 B 站 `playurl` / 直播 `playinfo` 接口，把视频
 
 - 参考项目：[realzza/bilibili-accelerator](https://github.com/realzza/bilibili-accelerator)（MIT）
 - 参考版本：`bilibili-accelerator.user.js` v0.4.1
-- 移植范围：CDN 主机分类判定、候选节点池、直播 `url_info` 过滤、`backupUrl` 扇出、force / bad-only 语义、`/live-bvc/` 排除规则
+- 移植范围：CDN 主机分类判定、候选节点池、直播 `url_info` 过滤、`backupUrl` 扇出、force / bad-only 语义、`/live-bvc/` 排除规则、明文 http 分片改写
 - 完整署名与上游许可全文：[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
 
 **真机验证范围。** 脚本逻辑有 257 项离线断言覆盖（含与上游逐条对照）；模块安装、`[Panel]` 段落、分片层改写已在真机上确认可用。MitM 证书、`cronexp` 触发与各客户端的具体行为仍需自行确认。
-
----
 
 ## 它做什么
 
@@ -34,7 +32,7 @@ Surge（接口层需要 MitM，分片层不需要）
                    用真实签名分片做 Range 请求测吞吐，排名写入 $persistentStore
 ```
 
-**为什么需要分片层**：官方 App 的 playurl 走 gRPC（protobuf），接口改写碰不到；但它的分片是**明文 http**，Surge 不做 MitM 也能看到并改写。真机 HAR 显示 App 的分片落在 `upos-hz-mirrorakam.akamaized.net`，把 host 换成测速最快的 `upos-sz-mirroraliov` 后**播放正常** —— URL 上的 `upsig`/`uparams` 校验通过，Akamai 的 `hdnts` token 被忽略。
+**为什么需要分片层**：官方 App 的 playurl 走 gRPC（protobuf），接口层碰不到它；但它的分片是**明文 http**，Surge 不做 MitM 也能看到并改写。真机 HAR 显示 App 的分片落在 `upos-hz-mirrorakam.akamaized.net`，把 host 换成测速最快的 `upos-sz-mirroraliov` 后**播放正常** —— URL 上的 `upsig`/`uparams` 校验通过，Akamai 的 `hdnts` token 被忽略。
 
 **视频流不做 MitM。** 分片层处理的是明文 http，接口层只解密那一个 JSON 接口，两者都不让 Surge 参与视频流加解密，4K 不会掉速。
 
@@ -50,33 +48,6 @@ Surge（接口层需要 MitM，分片层不需要）
 | `LICENSE` | MIT |
 | `THIRD-PARTY-NOTICES.md` | 上游 realzza/bilibili-accelerator 的 MIT 署名 |
 
-## 安装（iOS）
-
-### 方式一：从 URL 安装（推荐）
-
-1. Surge → 首页 → 模块 → 从 URL 安装，填入：
-
-   ```
-   https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/BiliFastCDN.sgmodule
-   ```
-
-2. 打开 **MitM** 总开关，并安装 / 信任证书。没有 MitM，脚本不会执行，模块等同于没开。
-3. 打开策略选择页，应该能看到「B站CDN」面板卡片。
-
-> **脚本更新不是即时的。** Surge 对远程脚本的缓存由 `script-update-interval` 控制，默认 `86400`（24 小时）。
-> 本模块显式设为 `1800`（30 分钟），并在 URL 上带 `?v=x.y.z` 当缓存键 —— 所以**改了 `bili-cdn.js` 必须同时改这个版本号**，
-> 否则已安装的用户要等 30 分钟才拿到新版；而早期没写 `script-update-interval` 的版本最长要等 24 小时。
-> 面板标题会显示当前实际加载的版本（`B站CDN v0.1.2`），排查任何问题前先看它。
-> 代价是模块内容与脚本版本不一一对应 —— 要固定版本就把三处换成 `raw/v0.1.0/bili-cdn.js`。
-> 注意 `raw.githubusercontent.com` 在国内通常不通，墙内使用请自行换镜像（会静默失效）。
-
-### 方式二：本地安装
-
-1. 把 `BiliFastCDN.sgmodule` 和 `bili-cdn.js` 放进 Surge 的目录（Files App →「我的 iPhone → Surge」），
-   并把模块里三处 `script-path` 改回本地文件名 `bili-cdn.js`。
-2. 在 Surge 的「模块」里安装并启用 `BiliFastCDN`。
-3. 同上第 2、3 步。
-
 ## 配置项
 
 模块参数表里可改（Surge 的模块参数编辑界面）：
@@ -89,12 +60,12 @@ Surge（接口层需要 MitM，分片层不需要）
 | `backupFanout` | `true` | 把候选节点写进 `backupUrl`，让播放器自己也能容错切换 |
 | `liveFilter` | `true` | 从直播 `url_info` 中剔除 PCDN 节点 |
 | `notify` | `true` | 测速完成后发通知 |
-| `debug` | `false` | 每次判定写进 Surge 日志，且每次改写发一条通知（30 秒内不重复） |
+| `debug` | `false` | 每次判定写进日志与请求详情注释，且每次改写发一条通知（30 秒内不重复） |
 
 改 `bili-cdn.js` 顶部常量还能调：候选节点池 `CANDIDATE_POOL`（按自己地区增删）、
 `DEFAULTS` 里的测速有效期 / 样本有效期 / 探测超时与字节数。测速频率改模块里的 `cronexp`。
 
-## 怎么确认生效了
+## 怎么确认生效
 
 **看面板。** 策略选择页的「B站CDN」卡片：
 
@@ -119,41 +90,22 @@ Surge（接口层需要 MitM，分片层不需要）
 
 点卡片右上角刷新按钮 = **立即重测**，不用等 30 分钟的定时任务。面板自身刷新（含自动刷新）只读已存结果，不发请求。
 
-排查时把 `debug` 打开，Surge 日志里会给出每次调用的 `bytes=` / `signal=` / `code=`，可以直接看出脚本有没有被触发。
+**看 debug 输出。** 打开 `debug` 后有两处落点：
 
-### 「触发 0 次」排查清单
-
-按这个顺序查，前 4 条是绝大多数情况：
-
-1. **面板标题的版本号**是不是你预期的那版 —— 远程脚本默认缓存 24 小时，看到旧行为先怀疑脚本没更新。
-2. **MitM 主机列表**：Surge → MitM，确认里面有 `api.bilibili.com`。模块用 `%APPEND%` 追加；
-   日志里出现 `Updating core settings, sections: ... MITM` 就代表 MITM 段已应用。
-3. **证书要「信任」而不只是「安装」**：设置 → 通用 → 关于本机 → 证书信任设置 → 打开 Surge 的开关。
-4. **分清是哪一层为 0**：接口层为 0 而分片层有数字，就是 App 场景（playurl 走 gRPC），不是故障。
-   两层都为 0 才需要继续查。
-5. **QUIC**：确认 profile 里没有 `auto-quic-block = false`。该值默认 `true`，会把命中 MitM 列表的 HTTP/3 连接挡掉，
-   让客户端回退到 h2/h1.1 才能被解密；关掉它 = B 站走 HTTP/3 时完全绕过 MitM。
-6. **`skip-server-cert-verify` 不是这个问题的解**。手册原文：它只 "relaxes verification of the real server"，
-   即放宽 **Surge → 源站** 的校验，客户端拿到的始终是 Surge 签发的证书 —— 所以它既不会导致、也治不好
-   客户端侧的连接中断。B站用公共可信证书，保持关闭（`false`）即可。
-7. **`MITM failed ... certificate pinning` 要看清是不是真的**：这条消息也会出现在**空闲/预热连接**上
-   （例如 TLS 握手完成后 60 秒内没有请求就关闭）。判断依据是 HAR：如果同一个 host 的其他请求返回 200，
-   说明 MitM 本身是通的，那这条只是被丢弃的连接，不是故障。
-8. **`client-source-address`**：如果 profile 限制了这个值且不含本机地址，本机自己发出的流量不会被解密。
-
-**看日志。** 打开 `debug` 后：
+1. **请求详情里的注释**（iOS 上最好找）：模块的 `[Script]` 行带了 `debug`，Surge 会把 `console.log` 放进该请求的注释。
+   到「请求记录」点开任意一条 playurl 或分片请求就能看到。
+2. **日志页面**：需要 `[General] loglevel = info`。该值默认为 `notify`，脚本输出会被过滤掉
+   （`verbose` 没必要，官方说明它会明显影响性能）。
 
 ```
 [BiliFastCDN] probe: upos-tf-all-hw.bilivideo.com status=200 251ms 33.42Mbps
 [BiliFastCDN] response: https://api.bilibili.com/x/player/playurl bytes=41337 signal=true code=0 rewrites=2 {"force-host":1} target=upos-tf-all-hw.bilivideo.com
 [BiliFastCDN]   force-host upos-sz-mirrorcos.bilivideo.com -> upos-tf-all-hw.bilivideo.com
-[BiliFastCDN] response: https://api.bilibili.com/x/player/playurl bytes=41 signal=false
 [BiliFastCDN] request: force-host upos-hz-mirrorakam.akamaized.net -> upos-tf-all-hw.bilivideo.com
 ```
 
-第二行那条 `signal=false` 是「脚本跑到了，但响应体里没有媒体地址」的形态；最后一行是分片层的一次改写。排查顺序：先看有没有 `response:` / `request:` 行（都没有就是两层都没看到流量），再看 `signal`。
-
-日志里只有域名、没有签名 query（`sign` / `deadline` / `oi` 一律不落盘），可以安全贴出来求助。
+`signal=false` 是「脚本跑到了，但响应体里没有媒体地址」的形态。日志里只有域名、没有签名 query
+（`sign` / `deadline` / `oi` 一律不落盘），可以安全贴出来求助。
 
 ## 与原项目的差异
 
@@ -180,7 +132,7 @@ Surge（接口层需要 MitM，分片层不需要）
 - **直播**（`/live-bvc/`）只做 PCDN 剔除，不做域名替换 —— 那是另一套 CDN 层级，换域名会直接把直播打死。
 - **MitM 会解密 `api.bilibili.com`**。若某客户端做了证书校验（出现接口报错、登录异常），把 `[MITM]` 里对应域名去掉即可；模块本身不会失效，只是那些接口不再被改写。
 - **签名分片 URL 会过期**。测速样本过期时该轮会退回纯延迟排序（面板会标注"仅延迟测速"）。
-- **面板** 依赖 `[Panel]` 段落被 Surge 接受。若卡片一直显示静态文案「点刷新按钮测速」，说明没生效，此时用日志 / `debug` 判断。
+- **面板** 依赖 `[Panel]` 段落被 Surge 接受。若卡片一直显示静态文案「点刷新按钮测速」，说明没生效，此时用计数与 `debug` 输出判断。
 
 ## 测试
 
@@ -192,14 +144,11 @@ chrome --headless=new --disable-gpu --allow-file-access-from-files \
 输出 `ALL n CHECKS PASSED` 或失败明细。覆盖内容：
 
 - **与上游对照**：18 个 URL 的 `classify` 判定与 `rewriteUrlDetail` 改写结果，逐条与参考实现比对（把 `bilibili-accelerator.user.js` 放到 `test/fixtures/` 下即可启用，未放则跳过并标注）
-- 两个角色的端到端模拟：改写（force / bad-only / 关闭 / 直播 / 空载荷）、测速（首次引导、样本过期回退、全部失败、结果缓存命中）
-- 签名 query 必须逐字节保留；日志不得出现 token
-- 面板三种状态、debug 开关与通知限流
+- 四个角色的端到端模拟：接口改写（force / bad-only / 关闭 / 直播 / 空载荷）、分片改写、测速（首次引导、样本过期回退、全部失败、结果缓存命中）、面板
+- 签名 query 必须逐字节保留；分片改写必须保持原 scheme；日志不得出现 token
+- 改写幂等（Surge 会对改写后的 URL 重跑脚本）
 - `$httpClient` 超时必须是秒级（Surge 该 API 的单位是秒，写毫秒会静默挂死 cron）
 
 ## 许可证
 
-
-本项目是 MIT 代码的衍生作品，**上游署名与许可全文必须保留**（这是唯一的硬约束，与选哪个许可无关）—— 见 `THIRD-PARTY-NOTICES.md`。
-
-`LICENSE` 已按 MIT 填写（版权人 MinamiHashiRun0，想换名字直接改）。该文件保持 MIT 标准全文，不要在其后追加内容 —— 否则 GitHub 无法识别许可证。
+本项目是 MIT 代码的衍生作品，上游署名与许可全文必须保留 —— 见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
