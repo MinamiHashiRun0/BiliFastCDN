@@ -18,7 +18,7 @@ Surge iOS 模块：劫持 B 站 `playurl` / 直播 `playinfo` 接口，把视频
   **字节级 protobuf 改写器与全部判定实现均为本项目自写，未复制其代码**
 - 完整署名与上游许可全文：[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
 
-**真机验证范围。** 脚本逻辑有 302 项离线断言覆盖（含与上游逐条对照与合成 protobuf fixture）。
+**真机验证范围。** 脚本逻辑有 304 项离线断言覆盖（含与上游逐条对照与合成 protobuf fixture）。
 已在真机确认：模块安装、`[Panel]` 段落、明文 http 分片改写可用（把 Akamai 分片换到 `upos-sz-mirroraliov` 后播放正常）。
 gRPC 层真机已确认一半：**默认引擎确实交付了 Uint8Array body**（真机 `gRPC 触发 13 次`），
 但当时 `改写 0 次` —— 根因是 body 是 gRPC **帧**序列而非裸 protobuf，解析器在第一个字节（压缩标志位）就放弃了，
@@ -43,7 +43,12 @@ Surge（接口/Grpc 层需要 MitM，分片层不需要）
 
 **为什么需要 gRPC 层**：官方 App 的 playurl 走 `grpc.biliapi.net`（protobuf），JSON 接口层碰不到它。真机 HAR 显示 App 调的是
 `bilibili.app.playerunite.v1.Player/PlayViewUnite` 与 `bilibili.app.playurl.v1.PlayURL/PlayConf`，而它拿到的分片落在
-`upos-hz-mirrorakam.akamaized.net`（Akamai）。现在这一层直接在 protobuf 里把主机名换掉，播放器从第一步就拿不到慢节点。
+`upos-hz-mirrorakam.akamaized.net`（Akamai）。
+
+**注意两者的分工**：gRPC 层（字节层）**只清劣质节点，不碰健康节点**。因为 JSON 层改写后能补 `backupUrl` 扇出，
+而 protobuf 里补不了 —— 把健康节点也收敛到同一个 host 等于拆掉播放器自己的多 CDN 容错，那个 host 一抖整段就卡。
+「选最快」交给按请求改写的分片层，那里失败只影响单个分片。想强制字节层也换（例如固定港澳台目标），
+把对应分类参数从 `auto` 改成具体主机名即可。
 
 **分片层是兜底**：真实分片请求是明文 http（不需要 MitM）。真机验证过把 `upos-hz-mirrorakam.akamaized.net` 换成测速最快的
 `upos-sz-mirroraliov` 后播放正常 —— URL 上的 `upsig`/`uparams` 校验通过，Akamai 的 `hdnts` token 被忽略。
@@ -59,7 +64,7 @@ Surge（接口/Grpc 层需要 MitM，分片层不需要）
 | --- | --- |
 | `BiliFastCDN.sgmodule` | 模块本体：`[Script]` / `[Panel]` / `[MITM]` / 参数表 |
 | `bili-cdn.js` | 一个文件四种角色：接口改写 / 分片改写 / 测速 / 面板，按运行上下文分派 |
-| `test/verify.html` | 离线验证套件，302 项断言，用浏览器跑 |
+| `test/verify.html` | 离线验证套件，304 项断言，用浏览器跑 |
 | `LICENSE` | MIT |
 | `THIRD-PARTY-NOTICES.md` | 上游 realzza/bilibili-accelerator 的 MIT 署名 |
 
@@ -166,6 +171,13 @@ gRPC 那行尾巴是最近一次的**帧结构**，改写为 0 时靠它定位�
   **裸 IP 形式的 PCDN 节点识别不了**（JSON 层可以，gRPC 层暂时没有）。
 - **gRPC 的 pattern 是按方法名收窄的**（`PlayViewUnite` / `PlayView` / `PlayConf` / `PlayURL`）。判定按 body 内容做、
   不按方法名写死，所以 B 站以后再把别的接口迁到 gRPC 时，只需把新方法名加进模块那条 pattern 即可。
+- **两条 pattern 不能重叠**：Surge 每个请求只跑第一条匹配的脚本。JSON 那条的 pattern 必须只写 JSON 端点路径
+  （`/x/player/*/playurl`、`/pgc/player/*/playurl`、`getRoomPlayInfo`）—— 早期写成 `.*(playurl|...)` 会误匹配
+  gRPC 服务名里的 `playurl`，把 protobuf 响应交给按 JSON 处理的脚本。
+- **JSC 引擎下缓冲 gRPC body 会占 NE 进程内存**。官方文档明确说 JSC 在 NE 进程内运行、内存占用显著上升，
+  可能被系统终止；这也是 Redirect 给这几个条目加 `engine=webview` 的原因（WebView 在独立进程 + 可 JIT）。
+  本模块目前用默认引擎并把 `max-size` 限到 4MB；如果观察到卡顿或 NE 内存告警，把 gRPC 条目的 `engine` 改成 `webview`
+  是官方推荐的缓解手段（它只是脚本引擎，不是设置界面）。
 - **分片层没有 backupUrl 兜底**。接口层改写失败时播放器还能靠 `backupUrl` 换节点；分片层是逐个请求改写，
   目标节点若不可用就是分片失败。所以分片层的策略与接口层一致（`smart` 有排名时才全量改写），
   出问题时可以单独关掉 `mediaRewrite`。

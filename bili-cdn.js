@@ -11,7 +11,7 @@
   var K_STATS = "bili_fast_cdn.stats.v1";
 
   // Surge 对远程脚本默认缓存 86400 秒，面板标题带版本号才能确认设备上跑的是哪一版。
-  var VERSION = "0.1.7";
+  var VERSION = "0.1.8";
   var PANEL_TITLE = "B站CDN";
   var REASON_LABELS = {
     "force-host": "全量改写",
@@ -1074,15 +1074,20 @@
     return s.toLowerCase();
   }
 
-  // 只按主机名判定：protobuf 里我们能确认的只有主机名这一段，拿不到 query / 端口。
+  // 字节层（gRPC）只清劣质节点，不碰健康节点。
+  // 原因：JSON 层改写后能补 backupUrl 扇出，protobuf 里补不了 —— 把健康节点也收敛到
+  // 同一个 host 等于拆掉播放器自己的多 CDN 容错，那个 host 一抖整段就卡。
+  // "选最快"交给按请求改写的分片层，那里失败只影响单个分片。
   function shouldMoveHost(host, cfg, rank) {
+    var category = categoryOf(host);
+    var pinned = (category === "oversea" ? cfg.hostOversea
+      : (category === "bstar" ? cfg.hostBStar : cfg.hostPcdn)) !== "auto";
     if (host === targetFor(cfg, rank, host)) return false;
-    var ranked = !!(rank && rank.ranking.length);
-    var forceAll = cfg.mode === "force" || (cfg.mode === "smart" && ranked);
     if (isMcdnHost(host) && cfg.mcdnStrategy !== "off") return true;
     if (isKnownP2pHost(host) || IP_RE.test(host) || XY_MCDN_RE.test(host)) return true;
-    if (/\.akamaized\.net$/i.test(host)) return forceAll || cfg.rewriteAkamai;
-    if (forceAll && isBiliCdnHost(host)) return true;
+    if (/\.akamaized\.net$/i.test(host)) return cfg.rewriteAkamai;
+    // 用户明确指定了该分类的目标（不是 auto）时，健康节点也照换 —— 那是显式意图。
+    if (pinned) return true;
     return false;
   }
 
