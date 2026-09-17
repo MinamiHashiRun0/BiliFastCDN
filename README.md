@@ -181,11 +181,7 @@ chrome --headless=new --disable-gpu --allow-file-access-from-files \
 
 ## 许可证
 
-**建议 MIT**，理由：
 
-1. 本项目是 MIT 代码的衍生作品，**上游署名与许可全文必须保留**（这是唯一的硬约束，与选哪个许可无关）—— 见 `THIRD-PARTY-NOTICES.md`。
-2. 与上游同许可，组合作品最干净，别人拿去改也能直接用。
-3. Apache-2.0 同样兼容，额外附带专利授权，代价是多一套 NOTICE 机制；如果在意专利可选它。
-4. GPL 系虽然对 MIT 部分兼容，但会把整个组合作品拖入 copyleft，对一个 Surge 模块来说通常是给自己添麻烦。
+本项目是 MIT 代码的衍生作品，**上游署名与许可全文必须保留**（这是唯一的硬约束，与选哪个许可无关）—— 见 `THIRD-PARTY-NOTICES.md`。
 
 `LICENSE` 已按 MIT 填写（版权人 MinamiHashiRun0，想换名字直接改）。该文件保持 MIT 标准全文，不要在其后追加内容 —— 否则 GitHub 无法识别许可证。
