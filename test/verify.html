@@ -660,7 +660,7 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
       argument: "mode=smart&notify=false",
       http: () => { throw new Error("an idle panel refresh must not probe"); }
     });
-    check("the panel has a title", idle.donePayload.title, "B站CDN");
+    check("the panel title carries the script version", idle.donePayload.title, "B站CDN v" + api.VERSION);
     checkTrue("it says it has not been measured yet",
       idle.donePayload.content.indexOf("尚未测速") !== -1);
     checkTrue("it tells the user how to measure",

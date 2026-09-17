@@ -10,6 +10,8 @@
   var K_SAMPLE = "bili_fast_cdn.sample.v1";
   var K_STATS = "bili_fast_cdn.stats.v1";
 
+  // Surge 对远程脚本默认缓存 86400 秒，面板标题带版本号才能确认设备上跑的是哪一版。
+  var VERSION = "0.1.2";
   var PANEL_TITLE = "B站CDN";
   var REASON_LABELS = {
     "force-host": "全量改写",
@@ -802,7 +804,7 @@
   function runPanel(cfg) {
     try {
       if (!cfg.enabled || cfg.mode === "off") {
-        return done({ title: PANEL_TITLE, content: "已停用（模块参数 enabled=false）", style: "alert" });
+        return done({ title: panelTitle(), content: "已停用（模块参数 enabled=false）", style: "alert" });
       }
       if (typeof $trigger !== "undefined" && $trigger === "button") {
         log("panel: refresh tapped, starting a probe round");
@@ -813,8 +815,12 @@
       panelReport(cfg, null);
     } catch (e) {
       log("panel: failed (" + (e && e.message) + ")");
-      done({ title: PANEL_TITLE, content: "渲染失败：" + (e && e.message), style: "error" });
+      done({ title: panelTitle(), content: "渲染失败：" + (e && e.message), style: "error" });
     }
+  }
+
+  function panelTitle() {
+    return PANEL_TITLE + " v" + VERSION;
   }
 
   function panelReport(cfg, note) {
@@ -848,7 +854,7 @@
     else if (state.signals === 0) lines.push("脚本已触发但响应里没有媒体地址");
     else lines.push("有媒体地址但无需改写");
 
-    done({ title: PANEL_TITLE, content: lines.join("\n"), style: style });
+    done({ title: panelTitle(), content: lines.join("\n"), style: style });
   }
 
   function responseHeaders() {
@@ -943,6 +949,7 @@
 
   if (typeof module === "object" && module.exports) {
     module.exports = {
+      VERSION: VERSION,
       DEFAULTS: DEFAULTS,
       CANDIDATE_POOL: CANDIDATE_POOL,
       cleanHost: cleanHost,
