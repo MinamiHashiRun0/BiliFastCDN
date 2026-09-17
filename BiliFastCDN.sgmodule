@@ -1,40 +1,52 @@
 #!name=BiliFastCDN · B站CDN加速
-#!desc=v0.5.0 · 劫持 B 站 playurl / 直播 playinfo 接口，把视频 CDN 域名重写为实测最快的节点。
+#!desc=v1.0.0 · 后端移植自 Biliverse/Redirect：静态 URL Rewrite 改写港澳台/国际版/Akamai，脚本只处理 MCDN/PCDN，附状态面板。
 #!system=ios
-#!arguments=enabled:true,mode:smart,grpcRewrite:true,grpcGunzip:false,mediaRewrite:true,hostPcdn:auto,hostOversea:auto,hostBStar:auto,hostAkamai:auto,rewriteAkamai:false,hostMcdn:proxy-tf-all-ws.bilivideo.com,backupFanout:true,liveFilter:true,notify:true,debug:false
-#!arguments-desc=enabled:总开关。 mode:改写策略（smart 接口层全量改写、分片层与字节层只改写劣质节点；force 全量改写，分片层全量会让播放器失去主备冗余，慎用；bad-only 只改写 PCDN/劣质节点；off 关闭改写）。 grpcRewrite/mediaRewrite:分别开关 gRPC 与明文 http 分片两层。 grpcGunzip:是否解开 gzip 帧后再改 gRPC（App 的 playurl 实测全是 gzip 帧，不开则字节层一次也改不动；开启后改写过的帧按未压缩帧发回，客户端不认就会整条 playurl 失败，所以默认关）。 hostPcdn/hostOversea/hostBStar/hostAkamai:分类目标覆盖，填 auto 表示用测速排名第一（Akamai 例外：auto = 不动它），填主机名则固定用它（分别对应大陆、港澳台 *ov 与 cn-hk-eq-*、国际版 *bstar1、Akamai）。 rewriteAkamai:是否把 Akamai 的地址换掉（马来西亚这类 Akamai 效果差的地区要开；给 hostAkamai 填了主机名就等于同时打开它）。 hostMcdn:MCDN 的目标节点，默认 proxy-tf-all-ws.bilivideo.com（代理包裹）。 backupFanout:是否把候选节点写入 backupUrl。 liveFilter:是否从直播 url_info 中剔除 PCDN 节点。 notify:测速完成后是否发通知。 debug:把每次判定写进日志与请求详情注释，每次改写发一条通知（30 秒内不重复）。
+#!arguments=hostOverseaVideo:upos-sz-mirrorali.bilivideo.com,hostBStar:upos-sz-mirrorali.bilivideo.com,hostPcdn:upos-sz-mirrorali.bilivideo.com,hostMcdn:proxy-tf-all-ws.bilivideo.com,debug:false
+#!arguments-desc=hostOverseaVideo:港澳台与 Akamai 分片要换到的主机（默认 upos-sz-mirrorali.bilivideo.com，可填 upos-sz-mirrorcos / upos-sz-mirrorhw / cn-hk-eq-01-01 等）。 hostBStar:国际版分片要换到的主机。 hostPcdn:PCDN 分片要换到的主机。 hostMcdn:MCDN 的目标节点，默认走代理包裹 proxy-tf-all-ws.bilivideo.com。 debug:把每次判定写进请求详情注释（日志行保持简短，Surge 会掐掉过长日志的尾巴）。
 #
-# 版本号出现在三处，发版时一起改：本行上方的 #!desc、下面五条 script-path 的 ?v=、
-# 以及 bili-cdn.js 里的 VERSION。Surge 对模块与远程脚本都会缓存，版本号是判断
-# "设备上到底加载了哪一版"的唯一依据（模块列表看 desc，面板标题看 VERSION）。
+# 版本号出现在两处，发版时一起改：本行上方的 #!desc、下面三条 script-path 的 ?v=。
+# Surge 对模块与远程脚本都会缓存，版本号是判断"设备上到底加载了哪一版"的唯一依据
+# （模块列表看 desc，面板标题看 VERSION）。
 #
-# 安装：本文件与 bili-cdn.js 放进 Surge 目录 → 模块里启用 → 打开 MitM 总开关并信任证书。
-# 没有 MitM 脚本不会执行，模块等同于没开。用法、参数、已知限制见仓库 README。
-# 生效判断看策略页「B站CDN」卡片的两行计数：
-#   接口 触发/媒体/改写 = 网页版 playurl 那层（需要 MitM）
-#   分片 改写/总数      = 明文 http 分片那层（不需要 MitM）
-# 分片层在 smart 下只修劣质节点，扫描有数、改写 0 是常态，卡片会自己写这行说明。
-# 点卡片刷新按钮立即测速；debug 打开后判定会写进「请求详情 → 注释」，日志页需要 loglevel=info。
+# 后端结构（照搬 Biliverse/Redirect 的 Surge 版）：
+#   1. [General] force-http-engine-hosts：让 Surge 把这些主机/端口的 TCP 也按 HTTP 处理，
+#      否则重写与脚本都看不到它们（MCDN/PCDN 用的是非标准端口）。
+#   2. [URL Rewrite]：港澳台 *ov / cn-hk-eq-*、Akamai、国际版 *bstar1 的 upgcxcode 请求
+#      由 Surge 的重写引擎直接换 Host —— 不调用脚本、没有每次请求的脚本开销。
+#   3. [Script]：只有 MCDN（带端口/cdn/sid 参数）与 PCDN（:4480、:9305）落到脚本里，
+#      逻辑逐条对照 Redirect 的 request.bundle.js。
+#   4. [Panel]：状态卡片，显示生效目标与脚本计数（静态重写在引擎里执行，不计入计数）。
+#
+# 想改目标主机：四条目标都在模块参数表里，静态重写与脚本共用同一份参数。
+
+[General]
+force-http-engine-hosts = %APPEND% upos-sz-mirror*.bilivideo.com:80, cn-hk-eq-*.bilivideo.com:80, upos-*-mirrorakam.akamaized.net:80, *:4480, *:4483, *:486, *:8000, *:8082, *:9102
+
+# 静态重写：港澳台/国际版/Akamai 的 upgcxcode 请求换到对应目标主机（照搬 Redirect 的 12 条规则）。
+[URL Rewrite]
+^http:\/\/upos-sz-mirror[a-z0-9-]*ov\.bilivideo\.com(?::80)?\/upgcxcode\/ http://{{{hostOverseaVideo}}}/upgcxcode/ header
+^http:\/\/cn-hk-eq-[a-z0-9-]+\.bilivideo\.com(?::80)?\/upgcxcode\/ http://{{{hostOverseaVideo}}}/upgcxcode/ header
+^http:\/\/upos-hz-mirrorakam\.akamaized\.net(?::80)?\/upgcxcode\/ http://{{{hostOverseaVideo}}}/upgcxcode/ header
+^http:\/\/upos-sz-mirrorakam\.akamaized\.net(?::80)?\/upgcxcode\/ http://{{{hostOverseaVideo}}}/upgcxcode/ header
+^http:\/\/upos-sz-mirror[a-z0-9-]*bstar1\.bilivideo\.com(?::80)?\/upgcxcode\/ http://{{{hostBStar}}}/upgcxcode/ header
+^http:\/\/upos-bstar1-mirrorakam\.akamaized\.net(?::80)?\/upgcxcode\/ http://{{{hostBStar}}}/upgcxcode/ header
+^https:\/\/upos-sz-mirror[a-z0-9-]*ov\.bilivideo\.com(?::(?:443|4483))?\/upgcxcode\/ https://{{{hostOverseaVideo}}}/upgcxcode/ header
+^https:\/\/cn-hk-eq-[a-z0-9-]+\.bilivideo\.com(?::(?:443|4483))?\/upgcxcode\/ https://{{{hostOverseaVideo}}}/upgcxcode/ header
+^https:\/\/upos-hz-mirrorakam\.akamaized\.net(?::(?:443|4483))?\/upgcxcode\/ https://{{{hostOverseaVideo}}}/upgcxcode/ header
+^https:\/\/upos-sz-mirrorakam\.akamaized\.net(?::(?:443|4483))?\/upgcxcode\/ https://{{{hostOverseaVideo}}}/upgcxcode/ header
+^https:\/\/upos-sz-mirror[a-z0-9-]*bstar1\.bilivideo\.com(?::(?:443|4483))?\/upgcxcode\/ https://{{{hostBStar}}}/upgcxcode/ header
+^https:\/\/upos-bstar1-mirrorakam\.akamaized\.net(?::(?:443|4483))?\/upgcxcode\/ https://{{{hostBStar}}}/upgcxcode/ header
 
 [Script]
-BiliFastCDN-Rewrite = type=http-response,pattern=^https?://(api\.bilibili\.com|app\.bilibili\.com|api\.live\.bilibili\.com|api\.biliapi\.net|api\.snm0516\.aisee\.tv)/(x/player/(wbi/)?playurl|pgc/player/(api|web)/(v2/)?playurl|xlive/web-room/v[12]/index/getRoomPlayInfo),requires-body=1,max-size=10485760,timeout=20,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-cdn.js?v=0.5.0,script-update-interval=1800,debug={{{debug}}},argument=enabled={{{enabled}}}&mode={{{mode}}}&hostPcdn={{{hostPcdn}}}&hostOversea={{{hostOversea}}}&hostBStar={{{hostBStar}}}&hostAkamai={{{hostAkamai}}}&rewriteAkamai={{{rewriteAkamai}}}&hostMcdn={{{hostMcdn}}}&backupFanout={{{backupFanout}}}&liveFilter={{{liveFilter}}}&notify={{{notify}}}&debug={{{debug}}}
-# gRPC / protobuf：App 的 playurl 走这里。binary-body-mode 让 body 以 Uint8Array 传入，
-# 默认引擎即可（不需要 engine=webview）。判定按 body 内容做，不按方法名写死 ——
-# 以后 B 站再迁新方法（例如分区页 regionv2），把方法名加进下面的 pattern 即可。
-# max-size 是缓冲上限：超过就整条跳过（iOS 上过大会占 NE 进程内存），默认 1MB 偏小。
-BiliFastCDN-gRPC = type=http-response,pattern=^https?://(grpc\.biliapi\.net|app\.bilibili\.com|app\.biliapi\.net)/.*(PlayViewUnite|PlayView|PlayConf|PlayURL)(\?.*)?$,requires-body=1,binary-body-mode=1,max-size=4194304,timeout=10,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-cdn.js?v=0.5.0,script-update-interval=1800,debug={{{debug}}},argument=enabled={{{enabled}}}&mode={{{mode}}}&grpcRewrite={{{grpcRewrite}}}&grpcGunzip={{{grpcGunzip}}}&hostPcdn={{{hostPcdn}}}&hostOversea={{{hostOversea}}}&hostBStar={{{hostBStar}}}&hostAkamai={{{hostAkamai}}}&rewriteAkamai={{{rewriteAkamai}}}&hostMcdn={{{hostMcdn}}}&debug={{{debug}}}
-# 分片层只拦劣质家族（mcdn / 已知 P2P 域名 / os=mcdn），健康分片根本不进脚本：
-# Surge 每次调用脚本都要重新加载并跑一遍那个 JS VM，实测一次 20–300ms，而分片是一段
-# 视频几百上千次请求 —— 让健康分片白交这笔税，就会把播放器填缓冲的节奏拖垮。
-# 想让 mode=force / 分类固定目标也改写健康分片，把 pattern 换成下面这条（README 有说明）：
-#   ^http://[a-zA-Z0-9.-]+\.(bilivideo\.(com|cn|net)|akamaized\.net)(:[0-9]+)?/
-BiliFastCDN-Media = type=http-request,pattern=^http://(xy(\d+x){3}\d+xy\.mcdn\.bilivideo\.(cn|com|net)|upos-sz-mirror14b\.bilivideo\.com|[a-zA-Z0-9.-]+\.(szbdyd\.com|mountaintoys\.cn|nexusedgeio\.com|ahdohpiechei\.com))[:/]|^http://.*[?&]os=mcdn(&|$),timeout=5,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-cdn.js?v=0.5.0,script-update-interval=1800,debug={{{debug}}},argument=enabled={{{enabled}}}&mode={{{mode}}}&mediaRewrite={{{mediaRewrite}}}&hostPcdn={{{hostPcdn}}}&hostOversea={{{hostOversea}}}&hostBStar={{{hostBStar}}}&hostAkamai={{{hostAkamai}}}&rewriteAkamai={{{rewriteAkamai}}}&hostMcdn={{{hostMcdn}}}&debug={{{debug}}}
-BiliFastCDN-Probe = type=cron,cronexp="*/30 * * * *",timeout=60,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-cdn.js?v=0.5.0,script-update-interval=1800,argument=enabled={{{enabled}}}&mode={{{mode}}}&notify={{{notify}}}&debug={{{debug}}}
-BiliFastCDN-Panel = type=generic,timeout=30,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-cdn.js?v=0.5.0,script-update-interval=1800,argument=enabled={{{enabled}}}&mode={{{mode}}}&notify={{{notify}}}&debug={{{debug}}}
+# MCDN：主机名本身要换端口或换成 cdn/sid 指定的主机，静态规则表达不了，交给脚本。
+BiliFastCDN-MCDN = type=http-request,pattern=^https?://[adbcefxy0-9]+\.mcdn\.bilivideo\.cn(?::(?:486|8000|8082|4483|9102))?/,timeout=5,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-cdn.js?v=1.0.0,script-update-interval=1800,debug={{{debug}}},argument=hostOverseaVideo={{{hostOverseaVideo}}}&hostBStar={{{hostBStar}}}&hostPcdn={{{hostPcdn}}}&hostMcdn={{{hostMcdn}}}&debug={{{debug}}}
+# PCDN：:4480 回 xy_usource 原节点，:9305 主机名藏在路径第一段里。
+BiliFastCDN-PCDN = type=http-request,pattern=^https?://[^/]+:(?:4480|9305)/,timeout=5,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-cdn.js?v=1.0.0,script-update-interval=1800,debug={{{debug}}},argument=hostOverseaVideo={{{hostOverseaVideo}}}&hostBStar={{{hostBStar}}}&hostPcdn={{{hostPcdn}}}&hostMcdn={{{hostMcdn}}}&debug={{{debug}}}
+BiliFastCDN-Panel = type=generic,timeout=30,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-cdn.js?v=1.0.0,script-update-interval=1800,argument=hostOverseaVideo={{{hostOverseaVideo}}}&hostBStar={{{hostBStar}}}&hostPcdn={{{hostPcdn}}}&hostMcdn={{{hostMcdn}}}&debug={{{debug}}}
 
-# 点刷新按钮 = 立即测速；自动刷新只读缓存，不发请求。
 [Panel]
-BiliFastCDN = title="B站CDN",content="点刷新按钮测速",style=info,script-name=BiliFastCDN-Panel,update-interval=1
+BiliFastCDN = title="B站CDN",content="加载中",style=info,script-name=BiliFastCDN-Panel,update-interval=1
 
+# 静态重写要能看见 https 请求就得解密这些主机；明文 http（官方 App 的分片）不需要 MitM。
 [MITM]
-hostname = %APPEND% api.bilibili.com, app.bilibili.com, grpc.biliapi.net, app.biliapi.net, api.live.bilibili.com, api.biliapi.net, api.snm0516.aisee.tv
+hostname = %APPEND% upos-sz-mirror*.bilivideo.com, cn-hk-eq-*.bilivideo.com, upos-*-mirrorakam.akamaized.net, *.mcdn.bilivideo.cn
