@@ -11,9 +11,9 @@
 # 点卡片刷新按钮立即测速；debug 参数可把每次判定写进 Surge 日志。
 
 [Script]
-BiliFastCDN-Rewrite = type=http-response,pattern=^https?://(api\.bilibili\.com|app\.bilibili\.com|api\.live\.bilibili\.com|api\.biliapi\.net|api\.snm0516\.aisee\.tv)/.*(playurl|getRoomPlayInfo),requires-body=1,max-size=10485760,timeout=20,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-cdn.js,argument=enabled={{{enabled}}}&mode={{{mode}}}&backupFanout={{{backupFanout}}}&liveFilter={{{liveFilter}}}&notify={{{notify}}}&debug={{{debug}}}
-BiliFastCDN-Probe = type=cron,cronexp="*/30 * * * *",timeout=60,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-cdn.js,argument=enabled={{{enabled}}}&mode={{{mode}}}&notify={{{notify}}}&debug={{{debug}}}
-BiliFastCDN-Panel = type=generic,timeout=30,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-cdn.js,argument=enabled={{{enabled}}}&mode={{{mode}}}&notify={{{notify}}}&debug={{{debug}}}
+BiliFastCDN-Rewrite = type=http-response,pattern=^https?://(api\.bilibili\.com|app\.bilibili\.com|api\.live\.bilibili\.com|api\.biliapi\.net|api\.snm0516\.aisee\.tv)/.*(playurl|getRoomPlayInfo),requires-body=1,max-size=10485760,timeout=20,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-cdn.js?v=0.1.2,script-update-interval=1800,argument=enabled={{{enabled}}}&mode={{{mode}}}&backupFanout={{{backupFanout}}}&liveFilter={{{liveFilter}}}&notify={{{notify}}}&debug={{{debug}}}
+BiliFastCDN-Probe = type=cron,cronexp="*/30 * * * *",timeout=60,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-cdn.js?v=0.1.2,script-update-interval=1800,argument=enabled={{{enabled}}}&mode={{{mode}}}&notify={{{notify}}}&debug={{{debug}}}
+BiliFastCDN-Panel = type=generic,timeout=30,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-cdn.js?v=0.1.2,script-update-interval=1800,argument=enabled={{{enabled}}}&mode={{{mode}}}&notify={{{notify}}}&debug={{{debug}}}
 
 # 点刷新按钮 = 立即测速；自动刷新只读缓存，不发请求。
 [Panel]

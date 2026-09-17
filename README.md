@@ -56,9 +56,12 @@ Surge MitM（只覆盖 API 域名）
 2. 打开 **MitM** 总开关，并安装 / 信任证书。没有 MitM，脚本不会执行，模块等同于没开。
 3. 打开策略选择页，应该能看到「B站CDN」面板卡片。
 
-> 模块里三处 `script-path` 指向 `raw/main/bili-cdn.js`，所以更新脚本只需 push，用户不用重装模块。
-> 代价是模块内容与脚本版本不一一对应 —— 要固定版本就把这三处换成 `raw/v0.1.0/bili-cdn.js`。
-> 注意 `raw.githubusercontent.com` 在国内通常不通，墙内使用请自行换镜像（模块会静默失效：面板一直「命中 0 次」）。
+> **脚本更新不是即时的。** Surge 对远程脚本的缓存由 `script-update-interval` 控制，默认 `86400`（24 小时）。
+> 本模块显式设为 `1800`（30 分钟），并在 URL 上带 `?v=x.y.z` 当缓存键 —— 所以**改了 `bili-cdn.js` 必须同时改这个版本号**，
+> 否则已安装的用户要等 30 分钟才拿到新版；而早期没写 `script-update-interval` 的版本最长要等 24 小时。
+> 面板标题会显示当前实际加载的版本（`B站CDN v0.1.2`），排查任何问题前先看它。
+> 代价是模块内容与脚本版本不一一对应 —— 要固定版本就把三处换成 `raw/v0.1.0/bili-cdn.js`。
+> 注意 `raw.githubusercontent.com` 在国内通常不通，墙内使用请自行换镜像（会静默失效）。
 
 ### 方式二：本地安装
 
@@ -106,6 +109,25 @@ Surge MitM（只覆盖 API 域名）
 点卡片右上角刷新按钮 = **立即重测**，不用等 30 分钟的定时任务。面板自身刷新（含自动刷新）只读已存结果，不发请求。
 
 排查时把 `debug` 打开，Surge 日志里会给出每次调用的 `bytes=` / `signal=` / `code=`，可以直接看出脚本有没有被触发。
+
+### 「触发 0 次」排查清单
+
+按这个顺序查，前 4 条是绝大多数情况：
+
+1. **面板标题的版本号**是不是你预期的那版 —— 远程脚本默认缓存 24 小时，看到旧行为先怀疑脚本没更新。
+2. **MitM 主机列表**：Surge → MitM，确认里面有 `api.bilibili.com`。模块用 `%APPEND%` 追加；
+   日志里出现 `Updating core settings, sections: ... MITM` 就代表 MITM 段已应用。
+3. **证书要「信任」而不只是「安装」**：设置 → 通用 → 关于本机 → 证书信任设置 → 打开 Surge 的开关。
+4. **换客户端试**：用 Safari 打开 `www.bilibili.com` 播一个视频。**官方 App 的 playurl 走 gRPC（protobuf），本模块不覆盖**，
+   App 里永远是 0 次 —— 这不是配置错误。
+5. **QUIC**：确认 profile 里没有 `auto-quic-block = false`。该值默认 `true`，会把命中 MitM 列表的 HTTP/3 连接挡掉，
+   让客户端回退到 h2/h1.1 才能被解密；关掉它 = B 站走 HTTP/3 时完全绕过 MitM。
+6. **证书校验（pinning）**：Surge 日志里出现
+   `Client closed connection without sending any request over the MitM connection, it might because of certificate pinning`
+   说明客户端拒绝了 Surge 的证书。可先在 profile 的 `[MITM]` 段加 `h2 = true` 试试（该键模块无法设置，只能写在主配置里）；
+   若仍然如此，说明这个客户端确实做了 pinning，只能用网页版。
+   同时注意：这类客户端在装上本模块后可能出现接口报错 / 登录异常，那就把 `[MITM]` 里对应域名删掉。
+7. **`client-source-address`**：如果 profile 限制了这个值且不含本机地址，本机自己发出的流量不会被解密。
 
 **看日志。** 打开 `debug` 后：
 
