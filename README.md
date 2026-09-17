@@ -18,7 +18,7 @@ Surge iOS 模块：劫持 B 站 `playurl` / 直播 `playinfo` 接口，把视频
   **字节级 protobuf 改写器与全部判定实现均为本项目自写，未复制其代码**
 - 完整署名与上游许可全文：[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
 
-**真机验证范围。** 脚本逻辑有 330 项离线断言覆盖（含与上游逐条对照与合成 protobuf fixture）。
+**真机验证范围。** 脚本逻辑有 343 项离线断言覆盖（含与上游逐条对照与合成 protobuf fixture）。
 已在真机确认：模块安装、`[Panel]` 段落、分片层能截到明文 http 分片请求、debug 输出落在请求注释里。
 两次真机事故都进了回归测试：
 
@@ -26,6 +26,9 @@ Surge iOS 模块：劫持 B 站 `playurl` / 直播 `playinfo` 接口，把视频
    （`403 X-Tengine-Error: non-existent domain`）→ 主备全灭、播不了。v0.2.0 起 `smart` 下分片层只修劣质节点。
 2. 分片层把 App 下发的**裸 IP 形式** CDN 地址当 PCDN，换成主机名 → 403。裸 IP 是 App 自己做 HTTPDNS
    的结果（`203.121.59.225` = akam 边缘、`92.223.116.254` = cosov 边缘），不是 P2P；v0.3.0 起不再动它。
+3. **分片层在健康分片上白跑一趟也是成本**。同一条视频对照抓包：模块关闭时 27 条分片同时在飞、每条 30–55ms；
+   模块开启时单条要 119/343ms，其中 27ms 与 **311ms** 花在我们的脚本里（网络部分都是 10–30ms）。
+   v0.4.0 起分片层的 pattern 收窄到劣质家族，健康分片不再进脚本。
 
 **gRPC 层真机已确认两件事**：默认引擎确实交付 Uint8Array body；而 App 的 playurl 响应**全是 gzip 帧**
 （实测 5/5，2990B 解压出 12476B message）—— 所以不解压就一次也改不动，`grpcGunzip` 是为此加的开关（默认关，
@@ -55,7 +58,25 @@ Surge（接口/Grpc 层需要 MitM，分片层不需要）
 **注意三层的分工**：接口层（JSON）会全量改写 —— 它在响应体里，改完还能补 `backupUrl` 扇出，播放器手里仍有第二、第三条地址。
 gRPC 层（字节层）与分片层在 `smart` 下**只清劣质节点，不碰健康节点**：protobuf 里补不了 `backupUrl`，
 而 `http-request` 拿到的是播放器**已经在用**的那条 URL，换掉之后播放器手上没有第二条地址可退。
-想强制它们也全量改写，用 `mode=force`，或把对应分类参数从 `auto` 改成具体主机名（那是显式意图，`smart` 下同样生效）。
+分类固定目标（`hostOversea` 等）由**响应层**执行：网页 JSON 层总会执行，字节层在 `grpcGunzip` 打开时会执行；
+分片层的 pattern 只覆盖劣质家族，健康分片根本不进脚本（原因见下）。
+
+**分片层为什么不放在健康分片上跑**：Surge 调用一次脚本要把脚本重新加载并在 JSE 里跑一遍，
+真机实测**一次 20–300ms**，而一段视频的分片是几百上千次请求。2026-09-18 的对照抓包很直白：
+
+| | 分片请求 | 单条耗时 | 脚本占用 |
+| --- | --- | --- | --- |
+| 模块关闭 | 27 条同时在飞 | 30–55ms | 无 |
+| 模块开启 | 只起了 2 条 | 119 / 343ms | 27ms / **311ms** |
+
+网络那部分在两种情况下都是 10–30ms，多出来的全是脚本的调用成本；健康分片本来一条都不会被改写，
+白交这笔税只会把播放器填缓冲的节奏拖垮。所以现在 **pattern 只拦 mcdn、已知 P2P 域名（`szbdyd.com` /
+`mountaintoys.cn` / `nexusedgeio.com` / `ahdohpiechei.com`）、`upos-sz-mirror14b`、以及带 `os=mcdn` 的 http 地址**。
+想让 `mode=force` / 固定分类目标也改写健康分片，把模块里 `BiliFastCDN-Media` 那条的 pattern 换成：
+
+```
+^http://[a-zA-Z0-9.-]+\.(bilivideo\.(com|cn|net)|akamaized\.net)(:[0-9]+)?/
+```
 
 **分片层的实测教训**：分片 URL 上的 `upsig`/`uparams` 校验对主机名不敏感 —— 把 `upos-hz-mirrorakam.akamaized.net`
 的分片换到 `upos-sz-mirroraliov`，在解析正常的边缘上确实 206 通过（Akamai 的 `hdnts` token 被忽略）。
@@ -78,7 +99,7 @@ gRPC 层（字节层）与分片层在 `smart` 下**只清劣质节点，不碰�
 | --- | --- |
 | `BiliFastCDN.sgmodule` | 模块本体：`[Script]` / `[Panel]` / `[MITM]` / 参数表 |
 | `bili-cdn.js` | 一个文件四种角色：接口改写 / 分片改写 / 测速 / 面板，按运行上下文分派 |
-| `test/verify.html` | 离线验证套件，330 项断言，用浏览器跑 |
+| `test/verify.html` | 离线验证套件，343 项断言，用浏览器跑 |
 | `LICENSE` | MIT |
 | `THIRD-PARTY-NOTICES.md` | 上游 realzza/bilibili-accelerator 的 MIT 署名 |
 
@@ -92,7 +113,7 @@ gRPC 层（字节层）与分片层在 `smart` 下**只清劣质节点，不碰�
 | `mode` | `smart` | `smart` 接口层全量改写、gRPC 层与分片层只动劣质节点；`force` 三层都全量改写（分片层全量会让播放器失去主备冗余，慎用）；`bad-only` 只改写 PCDN / 劣质节点；`off` 关闭改写 |
 | `grpcRewrite` | `true` | 是否启用 gRPC（protobuf）响应改写 |
 | `grpcGunzip` | `false` | 是否先解开 gzip 帧再改 gRPC。App 的 playurl 实测全是 gzip 帧，不开则字节层一次也改不动；开启后改写过的帧按未压缩帧发回，客户端不认就会整条 playurl 失败，所以默认关 |
-| `mediaRewrite` | `true` | 是否启用明文 http 分片改写（官方 App 只有这层覆盖得到） |
+| `mediaRewrite` | `true` | 是否启用明文 http 分片改写（官方 App 只有这层覆盖得到）。分片层的 pattern 只覆盖劣质家族，健康分片不会调用脚本 |
 | `hostPcdn` / `hostOversea` / `hostBStar` | `auto` | 分类目标覆盖。`auto` = 用测速排名第一；填主机名则固定用它。分类按**来源主机名**判定：`upos-sz-mirror*ov` 与 `cn-hk-eq-*` 属港澳台，`*bstar1` 属国际版，其余按大陆 |
 | `hostMcdn` | `proxy-tf-all-ws.bilivideo.com` | MCDN 的目标节点（默认代理包裹，与 realzza、Biliverse/Redirect 两者的默认一致） |
 | `backupFanout` | `true` | 把候选节点写进 `backupUrl`，让播放器自己也能容错切换 |
@@ -238,7 +259,9 @@ gRPC 那行尾巴是最近一次的**帧结构**，改写为 0 时靠它定位�
   分片层是逐个请求改写，而且改的就是播放器正在用的那条 URL。真机踩过：一条分片的主备候选被一起收敛到同一个主机名，
   而那个主机名在本地被解析到一个不服务该域名的阿里云边缘（`403 X-Tengine-Error: non-existent domain`），
   主备一起失败，视频直接放不出来（不是卡顿，是播不了）。所以 v0.2.0 起 `smart` 下分片层只修劣质节点，
-  要全量改写必须显式 `mode=force`。出问题也可以单独关 `mediaRewrite`。
+  v0.4.0 起连 pattern 都收窄到劣质家族 —— 健康分片不进脚本，也就没有"白跑一趟"的调用成本。出问题也可以单独关 `mediaRewrite`。
+- **分片层的 pattern 收窄是有代价的**：`mode=force` 与分类固定目标（`hostOversea` 等）不再作用于健康分片
+  （它们仍作用于接口层与字节层）。要恢复"健康分片也改写"，按上面「注意三层的分工」里给出的那条 pattern 替换即可。
 - **测速排名只代表"测速那一刻、那条 DNS 解析路径"**。`-ov` 这类出海镜像的主机名在不同网络、不同解析器下会落到
   不同边缘，同一个主机名可以一边 206 一边 403（原因见上一条）。所以测速被否掉的候选会记进排名并在面板上显示，
   而分片层不再把全部流量押在排名第一上。
@@ -263,6 +286,7 @@ chrome --headless=new --disable-gpu --allow-file-access-from-files \
   `test/fixtures/` 下即可启用，未放则跳过并标注
 - 五个角色的端到端模拟：接口改写（force / bad-only / 关闭 / 直播 / 空载荷）、gRPC 改写、分片改写、测速（首次引导、样本过期回退、全部失败、结果缓存命中）、面板
 - 分片层策略：`smart` 下健康节点原样放过、一条分片的主备候选都保持原生、`force` 才全量改写、分类固定目标在 `smart` 下照办（这几条是对"主备一起 403 导致播不了"的回归）
+- **分片层 pattern 的意图**：8 条劣质家族 URL 必须命中、5 条健康/裸 IP/https URL 必须放过 —— pattern 与模块里那条保持一致，改一边就要改另一边
 - 裸 IP 回归：分片层与字节层都不动 IP 形式的 CDN 地址（对"把 IP 当 PCDN 换掉导致 403"的回归）
 - gRPC gzip：默认不解压（整帧放行并计数）、`grpcGunzip` 开启后解压→改写→按未压缩帧发回、
   解压失败 / `$utils` 缺失 / 返回值不是 message 三种情况都原样保留
