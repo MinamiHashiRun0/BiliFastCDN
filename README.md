@@ -90,25 +90,33 @@ Surge MitM（只覆盖 API 域名）
 ```
 目标 tf-all-hw · 41.9 Mbps
 测速 12 分钟前 · 8 个节点
-命中 9 次 · 改写 27 处 · 直播剔除 3
+触发 12 次 · 含媒体 9 次 · 改写 27 处 · 直播剔除 3
 最近 全量改写：sz-mirrorcos → tf-all-hw
 ```
 
+三个计数器是排查用的，含义各不相同：
+
 | 现象 | 含义 |
 | --- | --- |
-| 命中 0 次 | 没收到 playurl 流量 → 检查 MitM 总开关和证书 |
-| 命中 >0、改写 0 处 | 流量到了，但 B 站自己选的节点本来就合格（`bad-only` 下的正常状态） |
+| 触发 0 次 | 改写脚本从未被执行 → MitM 没生效。确认 MitM 主机列表里有 `api.bilibili.com`、证书已在「设置 → 通用 → 关于本机 → 证书信任设置」里被信任、`auto-quic-block` 没被关掉 |
+| 触发 >0、含媒体 0 次 | 脚本跑了，但响应体里没有媒体地址 → 这个接口不是 playurl（例如用的是官方 App 的 gRPC 接口），或接口返回了错误 |
+| 含媒体 >0、改写 0 处 | 读到了媒体地址但无需改写（`bad-only` 下的正常状态） |
 | 改写 >0 处 | 生效了 |
 
 点卡片右上角刷新按钮 = **立即重测**，不用等 30 分钟的定时任务。面板自身刷新（含自动刷新）只读已存结果，不发请求。
+
+排查时把 `debug` 打开，Surge 日志里会给出每次调用的 `bytes=` / `signal=` / `code=`，可以直接看出脚本有没有被触发。
 
 **看日志。** 打开 `debug` 后：
 
 ```
 [BiliFastCDN] probe: upos-tf-all-hw.bilivideo.com status=200 251ms 33.42Mbps
-[BiliFastCDN] response: https://api.bilibili.com/x/player/playurl rewrites=2 {"force-host":1} target=upos-tf-all-hw.bilivideo.com
+[BiliFastCDN] response: https://api.bilibili.com/x/player/playurl bytes=41337 signal=true code=0 rewrites=2 {"force-host":1} target=upos-tf-all-hw.bilivideo.com
 [BiliFastCDN]   force-host upos-sz-mirrorcos.bilivideo.com -> upos-tf-all-hw.bilivideo.com
+[BiliFastCDN] response: https://api.bilibili.com/x/player/playurl bytes=41 signal=false
 ```
+
+最后一行是「脚本跑到了，但响应体里没有媒体地址」的形态。排查顺序：先看有没有 `response:` 行（没有就是 MitM 没生效），再看 `signal`。
 
 日志里只有域名、没有签名 query（`sign` / `deadline` / `oi` 一律不落盘），可以安全贴出来求助。
 
