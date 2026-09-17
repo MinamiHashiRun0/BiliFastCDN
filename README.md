@@ -18,7 +18,7 @@ Surge iOS 模块：劫持 B 站 `playurl` / 直播 `playinfo` 接口，把视频
   **字节级 protobuf 改写器与全部判定实现均为本项目自写，未复制其代码**
 - 完整署名与上游许可全文：[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
 
-**真机验证范围。** 脚本逻辑有 327 项离线断言覆盖（含与上游逐条对照与合成 protobuf fixture）。
+**真机验证范围。** 脚本逻辑有 330 项离线断言覆盖（含与上游逐条对照与合成 protobuf fixture）。
 已在真机确认：模块安装、`[Panel]` 段落、分片层能截到明文 http 分片请求、debug 输出落在请求注释里。
 两次真机事故都进了回归测试：
 
@@ -78,7 +78,7 @@ gRPC 层（字节层）与分片层在 `smart` 下**只清劣质节点，不碰�
 | --- | --- |
 | `BiliFastCDN.sgmodule` | 模块本体：`[Script]` / `[Panel]` / `[MITM]` / 参数表 |
 | `bili-cdn.js` | 一个文件四种角色：接口改写 / 分片改写 / 测速 / 面板，按运行上下文分派 |
-| `test/verify.html` | 离线验证套件，327 项断言，用浏览器跑 |
+| `test/verify.html` | 离线验证套件，330 项断言，用浏览器跑 |
 | `LICENSE` | MIT |
 | `THIRD-PARTY-NOTICES.md` | 上游 realzza/bilibili-accelerator 的 MIT 署名 |
 
@@ -168,21 +168,28 @@ gRPC 那行尾巴是最近一次的**帧结构**，改写为 0 时靠它定位�
    日志页还需要 `[General] loglevel = info`（默认 `notify` 会把脚本输出过滤掉，`verbose` 没必要）。
    想立刻看到，点面板卡片的刷新按钮触发一次测速。
 
+> **`debug` 是有代价的，诊断完请关掉。** 手册写明 `debug` 会 **reload 脚本**（每次执行都重新加载）。
+> 真机实测：打开 debug 后，我们每次脚本调用要 150–350ms（分片层每请求一次、gRPC 层每次 playurl 一次），
+> 关掉后这一项成本消失。它只是诊断开关，不是常开开关 —— 常开时在高分片数的视频上会明显拖慢整机网络处理。
+> 另外 Surge 会把过长的日志行**掐掉尾巴**（实测 `compresse<...14...>`，正好把计数掐掉），
+> 所以模块的判定行都写得很短、不重复主机名与 URL，计数放在前面。
+
 真机日志里长这样（注释字段原文，一次会话里同时能看到三层）：
 
 ```
-[BiliFastCDN] grpc: https://grpc.biliapi.net/bilibili.app.playerunite.v1.Player/PlayViewUnite bytes=2995 frames=1 compressed=1 rewrites=0
-[BiliFastCDN] response: https://api.bilibili.com/x/player/playurl bytes=41337 signal=true code=0 rewrites=2 {"force-host":1} target=upos-tf-all-hw.bilivideo.com
+[BiliFastCDN] grpc: bytes=3026 frames=1 compressed=1 rewrites=0
+[BiliFastCDN] response: bytes=41337 signal=true code=0 rewrites=2 {"force-host":1} target=upos-tf-all-hw.bilivideo.com
 [BiliFastCDN]   force-host upos-sz-mirrorcos.bilivideo.com -> upos-tf-all-hw.bilivideo.com
-[BiliFastCDN] request: pcdn-host 203.121.59.225 -> upos-sz-mirroraliov.bilivideo.com
+[BiliFastCDN] request: pcdn-host upos-sz-mirror14b.bilivideo.com -> upos-tf-all-hw.bilivideo.com
 [BiliFastCDN] probe: upos-tf-all-hw.bilivideo.com status=200 251ms 33.42Mbps
 ```
 
 三种要会看的形态：
 
-- `compressed=1 rewrites=0`：响应是 gzip 帧，字节层解不开 —— 默认配置下 App 的 playurl 永远停在这里（`grpcGunzip` 见上）。
-- `pcdn-host 203.121.59.225 -> …`：原始主机是**裸 IP**（App 自己做 HTTPDNS 的结果）。v0.3.0 起这种情况不再改写，
-  所以新日志里不会再出现以 IP 结尾的 `pcdn-host`。
+- `compressed=1 rewrites=0`：响应是 gzip 帧。默认配置下 App 的 playurl 永远停在这里；开了 `grpcGunzip` 后会多出
+  `unzipped=N`（= 解开并改写了几帧）。
+- `pcdn-host <主机名> -> …`：劣质节点被换掉。**注意原始主机是域名**；v0.2.0 的一次事故里这里是裸 IP
+  （App 的 HTTPDNS 结果，被当成 PCDN），v0.3.0 起裸 IP 不再改写。
 - `signal=false`：「脚本跑到了，但响应体里没有媒体地址」。
 
 日志里只有域名、没有签名 query（`sign` / `deadline` / `oi` 一律不落盘），可以安全贴出来求助。
@@ -236,6 +243,8 @@ gRPC 那行尾巴是最近一次的**帧结构**，改写为 0 时靠它定位�
   不同边缘，同一个主机名可以一边 206 一边 403（原因见上一条）。所以测速被否掉的候选会记进排名并在面板上显示，
   而分片层不再把全部流量押在排名第一上。
 - **直播**（`/live-bvc/`）只做 PCDN 剔除，不做域名替换 —— 那是另一套 CDN 层级，换域名会直接把直播打死。
+- **`debug` 不是常开开关**。手册写明它会 reload 脚本（每次执行重新加载），真机实测打开后我们每次调用要
+  150–350ms；分片层是按请求调用的，一段视频就是几百上千次。诊断完请关掉 —— 常开时它会拖慢整机而不只是本模块。
 - **MitM 会解密 `api.bilibili.com`**。若某客户端做了证书校验（出现接口报错、登录异常），把 `[MITM]` 里对应域名去掉即可；模块本身不会失效，只是那些接口不再被改写。
 - **签名分片 URL 会过期**。测速样本过期时该轮会退回纯延迟排序（面板会标注"仅延迟测速"）。
 - **面板** 依赖 `[Panel]` 段落被 Surge 接受。若卡片一直显示静态文案「点刷新按钮测速」，说明没生效，此时用计数与 `debug` 输出判断。

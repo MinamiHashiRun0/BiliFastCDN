@@ -624,6 +624,11 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     // Logs get pasted into bug reports; the signed query must never reach them.
     checkTrue("no signature material is logged",
       loud.logs.every((l) => l.indexOf("sign=") === -1 && l.indexOf("deadline=") === -1 && l.indexOf("oi=") === -1));
+    // Surge elides the tail of overlong log lines in the request notes (a device capture
+    // showed "...compresse<...14...>", hiding exactly the counters we needed), so the
+    // decision lines have to stay short.
+    checkTrue("decision lines stay inside the notes field (<= 120 chars)",
+      loud.logs.every((l) => l.length <= 120));
 
     // A burst of playurl responses must not post a notification each.
     const burst = await runSurge({
@@ -1010,6 +1015,11 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
       runGz.logs.some((l) => l.indexOf("compressed=1") !== -1));
     checkTrue("the debug line reports the frame count",
       runGz.logs.some((l) => l.indexOf("frames=1") !== -1));
+    // 同上：不要把签名/主机名塞进这一行，否则 Surge 会把计数掐掉。
+    checkTrue("the grpc debug line stays short",
+      runGz.logs.every((l) => l.length <= 120));
+    checkTrue("the grpc debug line no longer repeats the request url",
+      runGz.logs.every((l) => l.indexOf("biliapi.net") === -1));
   }
 
   // ---- 11. panel role -----------------------------------------------------

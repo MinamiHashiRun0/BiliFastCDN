@@ -11,7 +11,7 @@
   var K_STATS = "bili_fast_cdn.stats.v1";
 
   // Surge 对远程脚本默认缓存 86400 秒，面板标题带版本号才能确认设备上跑的是哪一版。
-  var VERSION = "0.3.0";
+  var VERSION = "0.3.1";
   var PANEL_TITLE = "B站CDN";
   var REASON_LABELS = {
     "force-host": "全量改写",
@@ -1378,7 +1378,7 @@
         recordResponse(cfg, gstats, false, gRank);
 
         if (cfg.debug) {
-          log("grpc: " + reqUrl.split("?")[0] + " bytes=" + bytes.length +
+          log("grpc: bytes=" + bytes.length +
             " frames=" + gres.frames + (gres.compressed ? " compressed=" + gres.compressed : "") +
             (gres.unzipped ? " unzipped=" + gres.unzipped : "") +
             (gres.framed ? "" : " not-framed") +
@@ -1419,10 +1419,9 @@
       recordResponse(cfg, stats, isLive, rank);
 
       if (cfg.debug) {
-        // reqUrl 在 ? 处截断：后面是带签名的 token。bytes/signal 用来判断到底是
-        // 脚本没被触发，还是触发了但拿到的不是媒体 JSON。
-        var line = "response: " + reqUrl.split("?")[0] +
-          " bytes=" + (typeof body === "string" ? body.length : "-") +
+        // 主机名与路径不放进来：那条请求本身就是上下文，而 Surge 会把过长的日志行
+        // 掐掉尾巴（实测 "compresse<...14...>"），关键数字必须落在前面才看得见。
+        var line = "response: bytes=" + (typeof body === "string" ? body.length : "-") +
           " signal=" + stats.signal;
         if (parsed) {
           line += " code=" + (parsed.code === undefined ? "-" : parsed.code) +
