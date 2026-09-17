@@ -1,22 +1,26 @@
-// BiliFastCDN —— Surge 后端移植自 Biliverse/Redirect（Apache-2.0，署名见 THIRD-PARTY-NOTICES.md）。
-// 本文件只做两件事：把 B 站下发的 CDN 请求换到指定主机，以及渲染状态面板。
-// 常规镜像（港澳台 *ov / cn-hk-eq-*、国际版 *bstar1、Akamai）由模块里的静态 [URL Rewrite] 规则
-// 直接改写，不经过脚本；只有 MCDN / PCDN 这些带端口或带参数的形式才落到这里。
-// 没有测速、没有排名、也不碰 playurl 响应 —— 这些在 Redirect 的后端里本来就不存在。
+// BiliFastCDN · 请求侧改写 —— 后端移植自 Biliverse/Redirect（Apache-2.0，署名见 THIRD-PARTY-NOTICES.md）。
+// 判定逐条对照 Redirect 的 src/process/Request.mjs（GET/HEAD 分支）；与上游的区别只有一个：
+// 目标主机可以由测速排名决定（参数填 auto），所以改写必须在脚本里做 —— 静态 [URL Rewrite]
+// 只能用固定值。排名与面板在 bili-speedtest.js 里，两边共用同一份 $persistentStore 数据。
 
 (function () {
   "use strict";
 
   var TAG = "[BiliFastCDN] ";
-  var VERSION = "1.0.0";
-  var K_STATS = "bili_fast_cdn.redirect.v1";
+  var VERSION = "1.1.0";
+  var K_RANK = "bili_fast_cdn.rank.v2";
+  var K_STATS = "bili_fast_cdn.stats.v1";
+
+  var AUTO = "auto";
+  var MCDN_PROXY_HOST = "proxy-tf-all-ws.bilivideo.com";
+  var BOOTSTRAP_HOST = "upos-sz-mirrorcosov.bilivideo.com";
 
   var DEFAULTS = {
-    // Redirect database.mjs 的默认值：三个分类都是阿里云 CDN，MCDN 走代理包裹。
-    hostOverseaVideo: "upos-sz-mirrorali.bilivideo.com",
-    hostBStar: "upos-sz-mirrorali.bilivideo.com",
-    hostPcdn: "upos-sz-mirrorali.bilivideo.com",
-    hostMcdn: "proxy-tf-all-ws.bilivideo.com",
+    // auto = 用测速排名第一；也可以填固定的镜像主机名。
+    hostOverseaVideo: AUTO,
+    hostBStar: AUTO,
+    hostPcdn: AUTO,
+    hostMcdn: MCDN_PROXY_HOST,
     debug: false
   };
 
@@ -28,7 +32,7 @@
     host_mcdn: "hostMcdn"
   };
 
-  // 来源主机名分组，逐条照搬 Redirect src/process/Request.mjs 的 switch。
+  // 来源主机名分组，逐条照搬 Redirect 的 switch。
   var MAINLAND_MIRRORS = [
     "upos-sz-mirrorali.bilivideo.com",
     "upos-sz-mirrorali02.bilivideo.com",
@@ -108,10 +112,11 @@
   function cleanHost(host) {
     var t = String(host == null ? "" : host).trim();
     if (!t || t.indexOf("{{{") !== -1) return "";
+    if (t.toLowerCase() === AUTO) return AUTO;
     return t.replace(/^[a-z]+:\/\//i, "").replace(/\/.*$/, "").replace(/:\d+$/, "").toLowerCase();
   }
 
-  function asHost(value, fallback) {
+  function asTarget(value, fallback) {
     return cleanHost(value) || fallback;
   }
 
@@ -141,12 +146,33 @@
       var target = Object.prototype.hasOwnProperty.call(DEFAULTS, key) ? key : (CFG_ALIASES[key] || null);
       if (target) cfg[target] = merged[key];
     }
-    cfg.hostOverseaVideo = asHost(cfg.hostOverseaVideo, DEFAULTS.hostOverseaVideo);
-    cfg.hostBStar = asHost(cfg.hostBStar, DEFAULTS.hostBStar);
-    cfg.hostPcdn = asHost(cfg.hostPcdn, DEFAULTS.hostPcdn);
-    cfg.hostMcdn = asHost(cfg.hostMcdn, DEFAULTS.hostMcdn);
+    cfg.hostOverseaVideo = asTarget(cfg.hostOverseaVideo, DEFAULTS.hostOverseaVideo);
+    cfg.hostBStar = asTarget(cfg.hostBStar, DEFAULTS.hostBStar);
+    cfg.hostPcdn = asTarget(cfg.hostPcdn, DEFAULTS.hostPcdn);
+    cfg.hostMcdn = asTarget(cfg.hostMcdn, DEFAULTS.hostMcdn);
     cfg.debug = asBool(cfg.debug, DEFAULTS.debug);
     return cfg;
+  }
+
+  // ---- 测速排名（与 bili-speedtest.js 共用同一个 key 与格式） ------------------
+
+  function loadRank() {
+    var j = safeParse(readStore(K_RANK));
+    if (!j || !j.ranking || !j.ranking.length) return null;
+    var hosts = [];
+    for (var i = 0; i < j.ranking.length; i++) {
+      var h = cleanHost(j.ranking[i]);
+      if (h && h !== AUTO && hosts.indexOf(h) === -1) hosts.push(h);
+    }
+    return hosts.length ? { at: j.at || 0, ranking: hosts } : null;
+  }
+
+  // 分类目标：填了固定主机就用它；auto 用测速第一；还没测速就落到兜底主机。
+  function resolveTarget(cfg, key) {
+    var value = cfg[key];
+    if (value && value !== AUTO) return value;
+    var rank = loadRank();
+    return rank ? rank.ranking[0] : BOOTSTRAP_HOST;
   }
 
   // ---- URL ------------------------------------------------------------------
@@ -199,17 +225,27 @@
   // ---- 判定（逐条对照 Redirect 的 GET/HEAD 分支） ---------------------------
 
   function classifyHost(cfg, host) {
-    if (MAINLAND_MIRRORS.indexOf(host) !== -1) return null;   // 目标本身，不动
-    if (OVERSEA_VIDEO_HOSTS.indexOf(host) !== -1) return { host: cfg.hostOverseaVideo, reason: "oversea-video" };
-    if (BSTAR_HOSTS.indexOf(host) !== -1) return { host: cfg.hostBStar, reason: "bstar" };
+    if (OVERSEA_VIDEO_HOSTS.indexOf(host) !== -1) {
+      return { host: resolveTarget(cfg, "hostOverseaVideo"), reason: "oversea-video" };
+    }
+    if (BSTAR_HOSTS.indexOf(host) !== -1) {
+      return { host: resolveTarget(cfg, "hostBStar"), reason: "bstar" };
+    }
     if (host.indexOf("upos-sz-mirror") === 0 && /ov\.bilivideo\.com$/.test(host)) {
-      return { host: cfg.hostOverseaVideo, reason: "oversea-video" };
+      return { host: resolveTarget(cfg, "hostOverseaVideo"), reason: "oversea-video" };
     }
     if (host.indexOf("cn-hk-eq-") === 0 && /\.bilivideo\.com$/.test(host)) {
-      return { host: cfg.hostOverseaVideo, reason: "oversea-video" };
+      return { host: resolveTarget(cfg, "hostOverseaVideo"), reason: "oversea-video" };
     }
     if (host.indexOf("upos-sz-mirror") === 0 && /bstar1\.bilivideo\.com$/.test(host)) {
-      return { host: cfg.hostBStar, reason: "bstar" };
+      return { host: resolveTarget(cfg, "hostBStar"), reason: "bstar" };
+    }
+    // 其余镜像（大陆与融合 CDN）：上游把它们当"目标本身"放过。用户要 auto 选最快时，
+    // 它们也收敛到测速第一；固定目标时保持上游语义。
+    if (/^upos-[a-z0-9-]+\.bilivideo\.(com|cn|net)$/.test(host)) {
+      if (cfg.hostPcdn !== AUTO) return null;
+      var fast = resolveTarget(cfg, "hostPcdn");
+      return fast && fast !== host ? { host: fast, reason: "pcdn-host" } : null;
     }
     return undefined;                                         // 交给端口判断
   }
@@ -252,7 +288,7 @@
 
     if (port === "4480") {
       // PCDN：回到 xy_usource 指向的原节点，没有就落到分类目标。
-      var source = cleanHost(queryParam(query, "xy_usource") || "") || cfg.hostPcdn;
+      var source = cleanHost(queryParam(query, "xy_usource") || "") || resolveTarget(cfg, "hostPcdn");
       return moved(buildUrl("http", source, "", path, query), host, source, "pcdn-upsource");
     }
 
@@ -277,15 +313,11 @@
     return null;
   }
 
-  // ---- 计数 / 面板 ----------------------------------------------------------
-
-  function emptyStats() {
-    return { calls: 0, rewrites: 0, reasons: {}, last: null };
-  }
+  // ---- 计数 -----------------------------------------------------------------
 
   function loadStats() {
     var j = safeParse(readStore(K_STATS));
-    var out = emptyStats();
+    var out = { calls: 0, rewrites: 0, reasons: {}, last: null };
     if (!j || typeof j !== "object") return out;
     var keys = Object.keys(out);
     for (var i = 0; i < keys.length; i++) {
@@ -300,24 +332,9 @@
     if (hit) {
       state.rewrites += 1;
       state.reasons[hit.reason] = (state.reasons[hit.reason] || 0) + 1;
-      state.last = { reason: hit.reason, from: hit.from, to: hit.to, at: Date.now() };
+      state.last = { reason: REASON_LABELS[hit.reason] || hit.reason, from: hit.from, to: hit.to, at: Date.now() };
     }
     writeStore(K_STATS, JSON.stringify(state));
-  }
-
-  function shorten(host) {
-    return String(host)
-      .replace(/\.bilivideo\.(com|cn|net)$/, "")
-      .replace(/\.akamaized\.net$/, "")
-      .replace(/^upos-/, "");
-  }
-
-  function reasonLabel(reason) {
-    return REASON_LABELS[reason] || reason;
-  }
-
-  function panelTitle() {
-    return "B站CDN v" + VERSION;
   }
 
   function runRequest(cfg) {
@@ -334,36 +351,7 @@
     }
   }
 
-  function runPanel(cfg) {
-    try {
-      var state = loadStats();
-      var lines = [];
-      var style = "info";
-
-      lines.push("静态规则（港澳台/国际版）→ " + shorten(cfg.hostOverseaVideo));
-      lines.push("脚本 MCDN → " + shorten(cfg.hostMcdn) + " · PCDN → " + shorten(cfg.hostPcdn));
-      lines.push("脚本 命中" + state.calls + " 改写" + state.rewrites);
-      if (state.last) {
-        lines.push("最近 " + reasonLabel(state.last.reason) + "：" +
-          shorten(state.last.from) + " → " + shorten(state.last.to));
-      }
-      if (state.rewrites > 0) style = "good";
-      else if (state.calls > 0) lines.push("MCDN/PCDN 里没有需要改写的条目");
-      else lines.push("尚未收到 MCDN/PCDN 请求（常规镜像由静态规则处理，不计入这里）");
-
-      done({ title: panelTitle(), content: lines.join("\n"), style: style });
-    } catch (e) {
-      log("panel: failed (" + (e && e.message) + ")");
-      done({ title: panelTitle(), content: "渲染失败：" + (e && e.message), style: "error" });
-    }
-  }
-
-  // ---- 入口 -----------------------------------------------------------------
-
-  // 角色按上下文判定，不按 $script.type：面板带 $input.purpose，请求脚本带 $request。
-  if (typeof $input !== "undefined" && $input && $input.purpose === "panel") {
-    runPanel(loadConfig());
-  } else if (typeof $request !== "undefined" && $request) {
+  if (typeof $request !== "undefined" && $request) {
     runRequest(loadConfig());
   } else {
     done();
@@ -377,14 +365,17 @@
       MAINLAND_MIRRORS: MAINLAND_MIRRORS,
       OVERSEA_VIDEO_HOSTS: OVERSEA_VIDEO_HOSTS,
       BSTAR_HOSTS: BSTAR_HOSTS,
+      K_RANK: K_RANK,
+      K_STATS: K_STATS,
       parseArgument: parseArgument,
       loadConfig: loadConfig,
+      loadRank: loadRank,
+      resolveTarget: resolveTarget,
       parseUrl: parseUrl,
       buildUrl: buildUrl,
       queryParam: queryParam,
       classifyHost: classifyHost,
-      rewriteRequest: rewriteRequest,
-      loadStats: loadStats
+      rewriteRequest: rewriteRequest
     };
   }
 })();

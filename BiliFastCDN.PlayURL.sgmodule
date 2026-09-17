@@ -1,0 +1,33 @@
+#!name=BiliFastCDN (PlayURL) · B站CDN加速
+#!desc=v1.1.0 · 响应侧改写 playurl（照 Biliverse/Redirect 的 response 分支思路），目标主机由自动测速排名决定，附状态面板。
+#!system=ios
+#!arguments=hostOverseaVideo:auto,hostBStar:auto,hostPcdn:auto,hostMcdn:proxy-tf-all-ws.bilivideo.com,notify:true,debug:false
+#!arguments-desc=hostOverseaVideo:港澳台（*ov、cn-hk-eq-*）与 Akamai 地址的目标主机。填 auto = 用测速最快；填主机名 = 固定用它。 hostBStar:国际版（*bstar1）地址的目标主机，auto 同上。 hostPcdn:大陆镜像与 PCDN 地址的目标主机，auto 同上。 hostMcdn:MCDN 地址的目标主机，默认 proxy-tf-all-ws.bilivideo.com（代理包裹）。 notify:测速完成后是否发通知。 debug:把每次判定写进请求详情注释。
+#
+# 版本号出现在两处，发版时一起改：#!desc 与下面三条 script-path 的 ?v=。
+# 两个脚本（bili-playurl.js / bili-speedtest.js）的 VERSION 用同一个值。
+#
+# 结构（对应 Redirect 的 beta 版思路：不改请求，改 playurl 响应）：
+#   1. 四条 http-response：App 的 gRPC playurl（binary-body-mode 拿 Uint8Array）与网页版的
+#      JSON playurl。拿到响应后把里面的媒体地址换到目标主机，播放器随后整段都按新地址拉流。
+#   2. 改写是字节级的：没有可换的主机名时输出与输入逐字节相同；protobuf 改写后会再校验一次
+#      能否解析，失败就整段放弃。gzip 帧用 $utils.ungzip 解开改写后按"未压缩帧"发回。
+#   3. 测速（cron，默认 30 分钟一次，满 6 小时才重测）+ 面板。面板里能看出有没有改写、
+#      是不是 gzip 帧、测速最快是哪个节点。
+#
+# 与「BiliFastCDN」那个模块二选一：那个是请求侧改分片，本模块是响应侧改 playurl。
+# 响应侧的好处是每条分片都不经过脚本；代价是要解密接口（MitM）并且改写 gzip 帧。
+
+[Script]
+BiliFastCDN.PlayURL.PlayerUnite = type=http-response,pattern=^https?://(grpc\.biliapi\.net|app\.bilibili\.com)/bilibili\.app\.playerunite\.v1\.Player/PlayViewUnite$,requires-body=1,binary-body-mode=1,engine=webview,max-size=4194304,timeout=10,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-playurl.js?v=1.1.0,script-update-interval=1800,debug={{{debug}}},argument=hostOverseaVideo={{{hostOverseaVideo}}}&hostBStar={{{hostBStar}}}&hostPcdn={{{hostPcdn}}}&hostMcdn={{{hostMcdn}}}&debug={{{debug}}}
+BiliFastCDN.PlayURL.PgcPlayView = type=http-response,pattern=^https?://(grpc\.biliapi\.net|app\.bilibili\.com)/bilibili\.pgc\.gateway\.player\.v2\.PlayURL/PlayView$,requires-body=1,binary-body-mode=1,engine=webview,max-size=4194304,timeout=10,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-playurl.js?v=1.1.0,script-update-interval=1800,debug={{{debug}}},argument=hostOverseaVideo={{{hostOverseaVideo}}}&hostBStar={{{hostBStar}}}&hostPcdn={{{hostPcdn}}}&hostMcdn={{{hostMcdn}}}&debug={{{debug}}}
+BiliFastCDN.PlayURL.PgcJson = type=http-response,pattern=^https?://api\.bili(bili\.com|api\.net)/pgc/player/(api|web)/playurl(\/html5)?\?,requires-body=1,engine=webview,max-size=4194304,timeout=10,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-playurl.js?v=1.1.0,script-update-interval=1800,debug={{{debug}}},argument=hostOverseaVideo={{{hostOverseaVideo}}}&hostBStar={{{hostBStar}}}&hostPcdn={{{hostPcdn}}}&hostMcdn={{{hostMcdn}}}&debug={{{debug}}}
+BiliFastCDN.PlayURL.PgcJsonV2 = type=http-response,pattern=^https?://api\.bili(bili\.com|api\.net)/pgc/player/web/v2/playurl\?,requires-body=1,engine=webview,max-size=4194304,timeout=10,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-playurl.js?v=1.1.0,script-update-interval=1800,debug={{{debug}}},argument=hostOverseaVideo={{{hostOverseaVideo}}}&hostBStar={{{hostBStar}}}&hostPcdn={{{hostPcdn}}}&hostMcdn={{{hostMcdn}}}&debug={{{debug}}}
+BiliFastCDN-Probe = type=cron,cronexp="*/30 * * * *",timeout=60,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-speedtest.js?v=1.1.0,script-update-interval=1800,argument=notify={{{notify}}}&debug={{{debug}}}
+BiliFastCDN-Panel = type=generic,timeout=30,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-speedtest.js?v=1.1.0,script-update-interval=1800,argument=notify={{{notify}}}&debug={{{debug}}}
+
+[Panel]
+BiliFastCDN = title="B站CDN",content="加载中",style=info,script-name=BiliFastCDN-Panel,update-interval=1
+
+[MITM]
+hostname = %APPEND% app.bilibili.com, app.biliapi.net, api.bilibili.com, api.biliapi.net, grpc.biliapi.net

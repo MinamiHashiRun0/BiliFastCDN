@@ -28,12 +28,19 @@
 
 - 只保留 Surge 一种客户端：去掉 handlebars 模板、rollup 构建、other-client 分支、BoxJs
   配置后端与 `[Map Local]` 配置注入，参数改由 Surge 模块参数表提供
-- 脚本改写为一个自包含的 Surge 脚本（原实现是一个多客户端 bundle）
-- 请求脚本条目收窄为 MCDN / PCDN 两种形态：常规镜像交给静态 `[URL Rewrite]`，不再为每条
-  健康分片调用脚本（真机实测每次脚本调用 20–300ms，分片是几百上千次请求）
-- 去掉 `Storage` / `LogLevel` 等设置项，`debug` 用一个布尔参数
-- 新增状态面板（原实现没有面板）
-- 日志与计数：新增每条改写的计数与最近一次改写记录供面板显示
+- 脚本改写为两个自包含的 Surge 脚本（原实现是一个多客户端 bundle）：请求侧 `bili-cdn.js`、
+  响应侧 `bili-playurl.js`
+- 目标主机可以填 `auto`（用测速排名第一）—— 测速与排名是本项目新增的（见下），
+  上游只有固定主机名。因为 `auto` 需要运行时决定目标，改写从静态 `[URL Rewrite]`
+  移到了脚本里（静态规则只能用固定值）
+- 请求模式不再按上游那样拆成多条（`^https?://.+\.bilivideo\.com/upgcxcode/` 等），
+  改成一条覆盖镜像/Akamai/MCDN/PCDN 的 pattern，判定仍逐条对照 `Request.mjs`
+- **响应侧模块（`BiliFastCDN.PlayURL` / `bili-playurl.js`）是自写实现**：按上游 response 分支的
+  思路与字段语义（`DashVideo.base_url`/`backup_url`、`ResponseUrl.url`/`backup_url`）在字节层改写，
+  未使用其 `@protobuf-ts` schema 或 `request/response.bundle.js` —— 那版 beta 产物所在的分支
+  已不存在，也没有随任何 release 发布
+- 去掉 `Storage` / `LogLevel` / BoxJs 设置项，`debug` 用一个布尔参数
+- 新增：测速（cron 探针 + 候选池排名）、状态面板，以及面板里的计数与最近一次改写记录
 
 ```
                                  Apache License
