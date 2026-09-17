@@ -662,22 +662,35 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
       http: () => { throw new Error("the media layer must never probe"); }
     });
 
-    // The app's playurl is gRPC so the payload layer never sees it, but its
-    // segments are plain http — this layer needs no MitM and is the only one that
-    // reaches the app at all.
+    // smart 下分片层只修劣质节点：一条分片的主备候选（akam / cosov）如果在请求层被
+    // 一起收敛到同一个主机名，而那个主机名在本地解析到一个没有该域名的边缘节点
+    // （实测 403 X-Tengine-Error: non-existent domain），主备会一起失败，整集放不出来。
+    // 响应层能全量改写是因为那里补得了 backupUrl 扇出，http-request 补不了。
     const akam = await asRequest(AKAM, "mode=smart", Object.assign({}, rankStore));
-    check("a plain-http akamai segment moves to the ranked host", akam.donePayload.url,
+    check("smart mode leaves a healthy akamai segment alone", akam.donePayload, {});
+    check("the media layer never probes", akam.httpCalls.length, 0);
+
+    const backup = "http://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/17/75/41787787517/41787787517-1-30232.m4s?deadline=1&os=cosovbv&upsig=abc&orderid=1,2";
+    const kept = await asRequest(backup, "mode=smart", Object.assign({}, rankStore));
+    check("and leaves the backup candidate native too", kept.donePayload, {});
+
+    // 全量改写要显式 mode=force：这时播放器手里没有第二条地址，风险由用户承担。
+    const forcedAkam = await asRequest(AKAM, "mode=force", Object.assign({}, rankStore));
+    check("force mode does move the akamai segment", forcedAkam.donePayload.url,
       AKAM.replace("upos-hz-mirrorakam.akamaized.net", TARGET));
     check("the media rewrite keeps the http scheme",
-      api.parseUrl(akam.donePayload.url).scheme, "http");
+      api.parseUrl(forcedAkam.donePayload.url).scheme, "http");
     check("the media rewrite keeps the signed query",
-      tailOf(akam.donePayload.url), tailOf(AKAM));
-    check("the media layer never probes", akam.httpCalls.length, 0);
+      tailOf(forcedAkam.donePayload.url), tailOf(AKAM));
 
     // Feeding the result back must not rewrite again: Surge re-runs the script on
     // the new URL, so a non-idempotent rule would loop.
-    const again = await asRequest(akam.donePayload.url, "mode=smart", Object.assign({}, rankStore));
+    const again = await asRequest(forcedAkam.donePayload.url, "mode=force", Object.assign({}, rankStore));
     check("the media rewrite is idempotent", again.donePayload, {});
+
+    const smartStats = JSON.parse(akam.store[K_STATS]);
+    check("a smart-mode pass-through still counts the scan", smartStats.mediaCalls, 1);
+    check("but records no rewrite", smartStats.mediaRewrites, 0);
 
     // Before the first measurement it stays conservative: only pcdn/mcdn move, and
     // Akamai is not one of those (rewriteAkamai defaults to false).
@@ -702,7 +715,11 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
 
     const OV = "http://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&sign=abc";
     const ovAuto = await asRequest(OV, "mode=smart", Object.assign({}, rankStore));
-    check("an oversea host follows the ranking by default", hostOf(ovAuto.donePayload.url), TARGET);
+    check("smart mode leaves a healthy oversea host alone too", ovAuto.donePayload, {});
+    const ovForce = await asRequest(OV, "mode=force", Object.assign({}, rankStore));
+    check("an oversea host follows the ranking in force mode",
+      hostOf(ovForce.donePayload.url), TARGET);
+    // 手填的分类目标是显式意图，不是测速猜的，分片层在 smart 下也照办。
     const ovPin = await asRequest(OV, "mode=smart&hostOversea=upos-hw.bilivideo.com",
       Object.assign({}, rankStore));
     check("a pinned oversea target overrides the ranking",
@@ -721,7 +738,7 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     const offLayer = await asRequest(AKAM, "mode=smart&mediaRewrite=false", Object.assign({}, rankStore));
     check("mediaRewrite=false disables the layer", offLayer.donePayload, {});
 
-    const counted = JSON.parse(akam.store[K_STATS]);
+    const counted = JSON.parse(forcedAkam.store[K_STATS]);
     check("a media call is counted", counted.mediaCalls, 1);
     check("a media rewrite is counted", counted.mediaRewrites, 1);
     check("the media layer leaves the payload counters alone", counted.calls, 0);
@@ -1033,6 +1050,39 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     checkTrue("and does not blame MitM for it",
       partial.donePayload.content.indexOf("未收到任何流量") === -1);
 
+    // 分片层在 smart 下扫描有数、改写 0 是常态：卡片得自己说明，否则又会被当成"没生效"。
+    const mediaIdle = await runSurge({
+      script: { type: "generic" }, input: panelInput, trigger: "auto-interval",
+      argument: "mode=smart&notify=false",
+      store: Object.assign({}, rankStore, {
+        [K_STATS]: JSON.stringify({
+          calls: 0, signals: 0, rewrites: 0, liveDropped: 0, grpcCalls: 0, grpcRewrites: 0,
+          mediaCalls: 41, mediaRewrites: 0, last: null, lastNotifyAt: 0
+        })
+      }),
+      http: () => { throw new Error("reporting must not probe"); }
+    });
+    checkTrue("the panel says why the media layer rewrote nothing",
+      mediaIdle.donePayload.content.indexOf("分片 smart 只修劣质节点") !== -1);
+    checkTrue("it does not claim the module is idle",
+      mediaIdle.donePayload.content.indexOf("未收到任何流量") === -1);
+
+    // 测速时被否掉的候选要能在卡片上看到，否则目标换了名字也没有解释。
+    const withReject = await runSurge({
+      script: { type: "generic" }, input: panelInput, trigger: "auto-interval",
+      argument: "mode=smart&notify=false",
+      store: {
+        [K_RANK]: JSON.stringify({
+          at: clock.now, via: "sample", ranking: [TARGET],
+          samples: [{ host: TARGET, mbps: 41.9, ms: 251 }],
+          rejected: [{ host: "upos-sz-mirroraliov.bilivideo.com", status: 403 }]
+        })
+      },
+      http: () => { throw new Error("reporting must not probe"); }
+    });
+    checkTrue("the panel names a rejected candidate and its status",
+      withReject.donePayload.content.indexOf("剔除 sz-mirroraliov(403)") !== -1);
+
     const offPanel = await runSurge({
       script: { type: "generic" }, input: panelInput, trigger: "button",
       argument: "enabled=false",
@@ -1147,6 +1197,29 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     checkTrue("latency probed the bare host path",
       expired.httpCalls.some((o) => o.url === "https://" + TARGET + "/"));
     checkTrue("the sample round ran first", expired.httpCalls[0].url.indexOf("/upgcxcode/") !== -1);
+
+    // 一个候选在测速时 403（实测形态：本地 DNS 把 *ov 镜像指到一个没有该域名的 CDN
+    // 边缘，返回 X-Tengine-Error: non-existent domain）。它必须被剔出排名，而且要留痕 ——
+    // 否则用户只看到"目标节点"换了个名字，猜不到自己选的那个当场就被否了。
+    const oneForbidden = { "upos-sz-mirroraliov.bilivideo.com": { status: 403, delay: 30 } };
+    const partial = await runSurge({
+      script: { type: "cron" },
+      argument: "notify=false",
+      store: {
+        [K_SAMPLE]: JSON.stringify({ at: clock.now, url: "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&sign=abc" })
+      },
+      http: (opts) => responder(opts, oneForbidden)
+    });
+    rank = JSON.parse(partial.store[K_RANK] || "{}");
+    check("a host that 403s is kept out of the ranking",
+      rank.ranking.indexOf("upos-sz-mirroraliov.bilivideo.com"), -1);
+    check("the rest of the pool still ranked", rank.ranking.length, 7);
+    check("the rejection is recorded once", rank.rejected.length, 1);
+    check("with its host and status",
+      [rank.rejected[0].host, rank.rejected[0].status],
+      ["upos-sz-mirroraliov.bilivideo.com", 403]);
+    check("a fully accepted round records no rejections",
+      JSON.parse(boot.store[K_RANK]).rejected.length, 0);
 
     // Total network failure must not wipe a usable ranking.
     const dead = JSON.stringify({ at: 0, via: "sample", ranking: [TARGET], samples: [] });

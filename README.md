@@ -18,8 +18,11 @@ Surge iOS 模块：劫持 B 站 `playurl` / 直播 `playinfo` 接口，把视频
   **字节级 protobuf 改写器与全部判定实现均为本项目自写，未复制其代码**
 - 完整署名与上游许可全文：[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
 
-**真机验证范围。** 脚本逻辑有 304 项离线断言覆盖（含与上游逐条对照与合成 protobuf fixture）。
-已在真机确认：模块安装、`[Panel]` 段落、明文 http 分片改写可用（把 Akamai 分片换到 `upos-sz-mirroraliov` 后播放正常）。
+**真机验证范围。** 脚本逻辑有 317 项离线断言覆盖（含与上游逐条对照与合成 protobuf fixture）。
+已在真机确认：模块安装、`[Panel]` 段落、分片层能截到明文 http 分片请求。
+但**「换到测速最快的节点就一定更快」这个前提被真机推翻过一次**：同一条分片的主备候选被一起换到排名第一的节点后，
+那个节点在本地解析不到（403），主备一起失败，视频直接放不出来 —— v0.2.0 因此把分片层在 `smart` 下退化成"只修劣质节点"，
+原因与证据见「已知限制」。
 gRPC 层真机已确认一半：**默认引擎确实交付了 Uint8Array body**（真机 `gRPC 触发 13 次`），
 但当时 `改写 0 次` —— 根因是 body 是 gRPC **帧**序列而非裸 protobuf，解析器在第一个字节（压缩标志位）就放弃了，
 v0.1.5 已修（见「已知限制」）。修正后的改写效果仍待真机确认；出问题可以单独关 `grpcRewrite`。
@@ -45,14 +48,16 @@ Surge（接口/Grpc 层需要 MitM，分片层不需要）
 `bilibili.app.playerunite.v1.Player/PlayViewUnite` 与 `bilibili.app.playurl.v1.PlayURL/PlayConf`，而它拿到的分片落在
 `upos-hz-mirrorakam.akamaized.net`（Akamai）。
 
-**注意两者的分工**：gRPC 层（字节层）**只清劣质节点，不碰健康节点**。因为 JSON 层改写后能补 `backupUrl` 扇出，
-而 protobuf 里补不了 —— 把健康节点也收敛到同一个 host 等于拆掉播放器自己的多 CDN 容错，那个 host 一抖整段就卡。
-「选最快」交给按请求改写的分片层，那里失败只影响单个分片。想强制字节层也换（例如固定港澳台目标），
-把对应分类参数从 `auto` 改成具体主机名即可。
+**注意三层的分工**：接口层（JSON）会全量改写 —— 它在响应体里，改完还能补 `backupUrl` 扇出，播放器手里仍有第二、第三条地址。
+gRPC 层（字节层）与分片层在 `smart` 下**只清劣质节点，不碰健康节点**：protobuf 里补不了 `backupUrl`，
+而 `http-request` 拿到的是播放器**已经在用**的那条 URL，换掉之后播放器手上没有第二条地址可退。
+想强制它们也全量改写，用 `mode=force`，或把对应分类参数从 `auto` 改成具体主机名（那是显式意图，`smart` 下同样生效）。
 
-**分片层是兜底**：真实分片请求是明文 http（不需要 MitM）。真机验证过把 `upos-hz-mirrorakam.akamaized.net` 换成测速最快的
-`upos-sz-mirroraliov` 后播放正常 —— URL 上的 `upsig`/`uparams` 校验通过，Akamai 的 `hdnts` token 被忽略。
-即使 gRPC 层因为 gzip 或缓冲上限跳过，分片层仍能兜住。
+**分片层的实测教训**：分片 URL 上的 `upsig`/`uparams` 校验对主机名不敏感 —— 把 `upos-hz-mirrorakam.akamaized.net`
+的分片换到 `upos-sz-mirroraliov`，在解析正常的边缘上确实 206 通过（Akamai 的 `hdnts` token 被忽略）。
+但**同一个主机名在不同网络与解析路径下会落到不同边缘**：真机上 `upos-sz-mirroraliov.bilivideo.com` 被解析到一个
+没有该域名的阿里云边缘，每条请求都是 `403 X-Tengine-Error: non-existent domain`。当时一条分片的主备候选
+（akam 与 cosov）都被收敛到了这一个主机名，于是主备一起 403，整集放不出来。这就是分片层不再全量改写的原因。
 
 **视频流不做 MitM。** 分片层处理的是明文 http，gRPC 层与接口层只解密接口响应，都不让 Surge 参与视频流加解密。
 
@@ -64,7 +69,7 @@ Surge（接口/Grpc 层需要 MitM，分片层不需要）
 | --- | --- |
 | `BiliFastCDN.sgmodule` | 模块本体：`[Script]` / `[Panel]` / `[MITM]` / 参数表 |
 | `bili-cdn.js` | 一个文件四种角色：接口改写 / 分片改写 / 测速 / 面板，按运行上下文分派 |
-| `test/verify.html` | 离线验证套件，304 项断言，用浏览器跑 |
+| `test/verify.html` | 离线验证套件，317 项断言，用浏览器跑 |
 | `LICENSE` | MIT |
 | `THIRD-PARTY-NOTICES.md` | 上游 realzza/bilibili-accelerator 的 MIT 署名 |
 
@@ -75,7 +80,7 @@ Surge（接口/Grpc 层需要 MitM，分片层不需要）
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
 | `enabled` | `true` | 总开关 |
-| `mode` | `smart` | `smart` 有测速结果时全量改写、无结果时只动劣质节点；`force` 总是改写；`bad-only` 只改写 PCDN / 劣质节点；`off` 关闭改写 |
+| `mode` | `smart` | `smart` 接口层全量改写、gRPC 层与分片层只动劣质节点；`force` 三层都全量改写（分片层全量会让播放器失去主备冗余，慎用）；`bad-only` 只改写 PCDN / 劣质节点；`off` 关闭改写 |
 | `grpcRewrite` | `true` | 是否启用 gRPC（protobuf）响应改写 |
 | `mediaRewrite` | `true` | 是否启用明文 http 分片改写（官方 App 只有这层覆盖得到） |
 | `hostPcdn` / `hostOversea` / `hostBStar` | `auto` | 分类目标覆盖。`auto` = 用测速排名第一；填主机名则固定用它。分类按**来源主机名**判定：`upos-sz-mirror*ov` 与 `cn-hk-eq-*` 属港澳台，`*bstar1` 属国际版，其余按大陆 |
@@ -106,12 +111,18 @@ Surge（接口/Grpc 层需要 MitM，分片层不需要）
 
 ```
 目标 sz-mirroraliov · 72.3 Mbps
-测速 1 分钟前 · 8 个节点
+测速 1 分钟前 · 8 个节点 · 剔除 sz-mirrorhwb(500)
 接口 触发12 媒体9 改写27
 gRPC 扫描23 改写21 · 最近 41KB 帧1 改写21
-分片 扫描156 改写150
-最近 gRPC替换：hz-mirrorakam → sz-mirroraliov
+分片 扫描156 改写0
+分片 smart 只修劣质节点（force 才全量）
+最近 全量改写：sz-mirrorcos → sz-mirroraliov
 ```
+
+- **「剔除 xxx(状态码)」**：这一轮测速里没应答的候选（`403`/`500`/超时都算）。它们不可能是好目标，
+  所以被剔出排名 —— 写出来是为了让你看到"我原本想用的那个节点，测速时就被否了"。
+- **「分片 smart 只修劣质节点」**：分片层扫描到请求但一条没改写时的说明。这是 `smart` 下的**正常状态**，
+  不是没生效。分片层只修 PCDN / MCDN 这类劣质节点，健康节点原样放过（原因见上）。
 
 gRPC 那行尾巴是最近一次的**帧结构**，改写为 0 时靠它定位（不必翻日志）：
 
@@ -127,6 +138,7 @@ gRPC 那行尾巴是最近一次的**帧结构**，改写为 0 时靠它定位�
 | --- | --- |
 | gRPC 改写 >0 | **gRPC 层生效**（官方 App 的 playurl 走这条，需要 MitM） |
 | 分片 改写 >0 | 分片层生效（明文 http 分片，不需要 MitM） |
+| 分片 扫描 >0、改写 0 | `smart` 下的正常状态：分片层只修劣质节点，健康节点放过（卡片会写这行） |
 | 接口 改写 >0 | 接口层生效（网页版 JSON playurl 走这条） |
 | 三层都 0 | 没有任何 B 站流量到达脚本 → 先看面板标题的版本号，再查 MitM |
 | 接口 触发 >0、媒体 0 | 接口被触发了但响应体里没有媒体地址（该接口不是 playurl，或接口报错） |
@@ -147,7 +159,7 @@ gRPC 那行尾巴是最近一次的**帧结构**，改写为 0 时靠它定位�
 [BiliFastCDN] probe: upos-tf-all-hw.bilivideo.com status=200 251ms 33.42Mbps
 [BiliFastCDN] response: https://api.bilibili.com/x/player/playurl bytes=41337 signal=true code=0 rewrites=2 {"force-host":1} target=upos-tf-all-hw.bilivideo.com
 [BiliFastCDN]   force-host upos-sz-mirrorcos.bilivideo.com -> upos-tf-all-hw.bilivideo.com
-[BiliFastCDN] request: force-host upos-hz-mirrorakam.akamaized.net -> upos-tf-all-hw.bilivideo.com
+[BiliFastCDN] request: pcdn-host upos-sz-mirror14b.bilivideo.com -> upos-tf-all-hw.bilivideo.com
 ```
 
 `signal=false` 是「脚本跑到了，但响应体里没有媒体地址」的形态。日志里只有域名、没有签名 query
@@ -189,9 +201,14 @@ gRPC 那行尾巴是最近一次的**帧结构**，改写为 0 时靠它定位�
   可能被系统终止；这也是 Redirect 给这几个条目加 `engine=webview` 的原因（WebView 在独立进程 + 可 JIT）。
   本模块目前用默认引擎并把 `max-size` 限到 4MB；如果观察到卡顿或 NE 内存告警，把 gRPC 条目的 `engine` 改成 `webview`
   是官方推荐的缓解手段（它只是脚本引擎，不是设置界面）。
-- **分片层没有 backupUrl 兜底**。接口层改写失败时播放器还能靠 `backupUrl` 换节点；分片层是逐个请求改写，
-  目标节点若不可用就是分片失败。所以分片层的策略与接口层一致（`smart` 有排名时才全量改写），
-  出问题时可以单独关掉 `mediaRewrite`。
+- **分片层没有 backupUrl 兜底，全量改写会拆掉播放器的主备冗余**。接口层改写失败时播放器还能靠 `backupUrl` 换节点；
+  分片层是逐个请求改写，而且改的就是播放器正在用的那条 URL。真机踩过：一条分片的主备候选被一起收敛到同一个主机名，
+  而那个主机名在本地被解析到一个不服务该域名的阿里云边缘（`403 X-Tengine-Error: non-existent domain`），
+  主备一起失败，视频直接放不出来（不是卡顿，是播不了）。所以 v0.2.0 起 `smart` 下分片层只修劣质节点，
+  要全量改写必须显式 `mode=force`。出问题也可以单独关 `mediaRewrite`。
+- **测速排名只代表"测速那一刻、那条 DNS 解析路径"**。`-ov` 这类出海镜像的主机名在不同网络、不同解析器下会落到
+  不同边缘，同一个主机名可以一边 206 一边 403（原因见上一条）。所以测速被否掉的候选会记进排名并在面板上显示，
+  而分片层不再把全部流量押在排名第一上。
 - **直播**（`/live-bvc/`）只做 PCDN 剔除，不做域名替换 —— 那是另一套 CDN 层级，换域名会直接把直播打死。
 - **MitM 会解密 `api.bilibili.com`**。若某客户端做了证书校验（出现接口报错、登录异常），把 `[MITM]` 里对应域名去掉即可；模块本身不会失效，只是那些接口不再被改写。
 - **签名分片 URL 会过期**。测速样本过期时该轮会退回纯延迟排序（面板会标注"仅延迟测速"）。
@@ -208,6 +225,8 @@ chrome --headless=new --disable-gpu --allow-file-access-from-files \
 
 - **与上游对照**：18 个 URL 的 `classify` 判定与 `rewriteUrlDetail` 改写结果，逐条与参考实现比对（把 `bilibili-accelerator.user.js` 放到 `test/fixtures/` 下即可启用，未放则跳过并标注）
 - 五个角色的端到端模拟：接口改写（force / bad-only / 关闭 / 直播 / 空载荷）、gRPC 改写、分片改写、测速（首次引导、样本过期回退、全部失败、结果缓存命中）、面板
+- 分片层策略：`smart` 下健康节点原样放过、一条分片的主备候选都保持原生、`force` 才全量改写、分类固定目标在 `smart` 下照办（这几条是对"主备一起 403 导致播不了"的回归）
+- 测速剔除留痕：403 的候选进不了排名、记进排名的 `rejected`、面板「剔除」尾巴能显示出主机名与状态码
 - 签名 query 必须逐字节保留；分片改写必须保持原 scheme；日志不得出现 token
 - 改写幂等（Surge 会对改写后的 URL 重跑脚本）
 - protobuf 改写：等长替换不改动任何长度前缀、变长替换（32→33）精确修正嵌套长度、改写后可重新解析出同样的结构、
