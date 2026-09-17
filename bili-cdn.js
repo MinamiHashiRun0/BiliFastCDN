@@ -11,7 +11,7 @@
   var K_STATS = "bili_fast_cdn.stats.v1";
 
   // Surge 对远程脚本默认缓存 86400 秒，面板标题带版本号才能确认设备上跑的是哪一版。
-  var VERSION = "0.1.2";
+  var VERSION = "0.1.3";
   var PANEL_TITLE = "B站CDN";
   var REASON_LABELS = {
     "force-host": "全量改写",
@@ -50,6 +50,9 @@
     portHeuristic: true,
     notify: true,
     debug: false,
+    // 明文 HTTP 的分片请求改写（无需 MitM）。App 的 playurl 走 gRPC，payload 改写
+    // 碰不到它，而它的分片是 http，所以这一层才是 App 生效的那一半。
+    mediaRewrite: true,
     rankTtlMs: 6 * 60 * 60 * 1000,
     sampleTtlMs: 90 * 60 * 1000,
     // 注意单位：Surge $httpClient 的 timeout 是秒，本文件其余 TTL 是毫秒。
@@ -59,6 +62,7 @@
 
   var CFG_ALIASES = {
     backup_fanout: "backupFanout",
+    media_rewrite: "mediaRewrite",
     live_filter: "liveFilter",
     mcdn_strategy: "mcdnStrategy",
     port_heuristic: "portHeuristic",
@@ -162,6 +166,7 @@
     cfg.debug = asBool(cfg.debug, DEFAULTS.debug);
     cfg.liveFilter = asBool(cfg.liveFilter, DEFAULTS.liveFilter);
     cfg.backupFanout = asBool(cfg.backupFanout, DEFAULTS.backupFanout);
+    cfg.mediaRewrite = asBool(cfg.mediaRewrite, DEFAULTS.mediaRewrite);
     cfg.rewriteAkamai = asBool(cfg.rewriteAkamai, DEFAULTS.rewriteAkamai);
     cfg.portHeuristic = asBool(cfg.portHeuristic, DEFAULTS.portHeuristic);
     cfg.rankTtlMs = asNumber(cfg.rankTtlMs, DEFAULTS.rankTtlMs);
@@ -204,6 +209,8 @@
 
     var q = tail.indexOf("?");
     return {
+      // 分片请求是明文 http，改写时必须保持原 scheme，别把 http 悄悄变成 https。
+      scheme: /^http:/i.test(s) ? "http" : "https",
       host: host.toLowerCase(),
       port: port,
       path: q === -1 ? tail : tail.slice(0, q),
@@ -213,7 +220,7 @@
   }
 
   // 只换 host：path 与 query 逐字节保留，签名在 query 里，改动即失效。
-  function swapHost(rawUrl, host) {
+  function swapHost(rawUrl, host, scheme) {
     if (typeof rawUrl !== "string") return null;
     var idx = rawUrl.indexOf("://");
     var start = idx === -1 ? 2 : idx + 3;
@@ -222,7 +229,7 @@
       var c = rawUrl.charAt(i);
       if (c === "/" || c === "?" || c === "#") { cut = i; break; }
     }
-    return "https://" + cleanHost(host) + rawUrl.slice(cut);
+    return (scheme || "https") + "://" + cleanHost(host) + rawUrl.slice(cut);
   }
 
   function isMediaPath(p) {
@@ -353,8 +360,8 @@
     return ok;
   }
 
-  function proxyUrl(rawUrl) {
-    return "https://" + MCDN_PROXY_HOST + "/?url=" + encodeURIComponent(rawUrl);
+  function proxyUrl(rawUrl, scheme) {
+    return (scheme || "https") + "://" + MCDN_PROXY_HOST + "/?url=" + encodeURIComponent(rawUrl);
   }
 
   // smart: 有测速结果时按 force 处理，没有结果时只动劣质节点。
@@ -368,18 +375,28 @@
     var target = bestHost(cfg, rank);
     var forceAll = cfg.mode === "force" || (cfg.mode === "smart" && !!(rank && rank.ranking.length));
 
+    // 已经是目标节点就直接放过：http-request 改写后 Surge 会拿新 URL 重跑脚本，
+    // 这一行断开回环。
+    if (p.host === target) return null;
+
     if (v.scheduler) {
-      return v.schedulerSource ? moved(swapHost(rawUrl, v.schedulerSource), p.host, v.schedulerSource, "scheduler") : null;
+      return v.schedulerSource
+        ? moved(swapHost(rawUrl, v.schedulerSource, p.scheme), p.host, v.schedulerSource, "scheduler")
+        : null;
     }
     if (v.mcdn && cfg.mcdnStrategy !== "off") {
-      if (cfg.mcdnStrategy === "proxy") return moved(proxyUrl(rawUrl), p.host, MCDN_PROXY_HOST, "mcdn-proxy");
-      return moved(swapHost(rawUrl, target), p.host, target, "mcdn-host");
+      if (cfg.mcdnStrategy === "proxy") {
+        return moved(proxyUrl(rawUrl, p.scheme), p.host, MCDN_PROXY_HOST, "mcdn-proxy");
+      }
+      return moved(swapHost(rawUrl, target, p.scheme), p.host, target, "mcdn-host");
     }
-    if (v.pcdn) return moved(swapHost(rawUrl, target), p.host, target, "pcdn-host");
-    if (cfg.rewriteAkamai && v.akamai) return moved(swapHost(rawUrl, target), p.host, target, "akamai-host");
+    if (v.pcdn) return moved(swapHost(rawUrl, target, p.scheme), p.host, target, "pcdn-host");
+    if (cfg.rewriteAkamai && v.akamai) {
+      return moved(swapHost(rawUrl, target, p.scheme), p.host, target, "akamai-host");
+    }
 
     if (forceAll && isBiliCdnHost(p.host) && p.host !== target) {
-      return moved(swapHost(rawUrl, target), p.host, target, "force-host");
+      return moved(swapHost(rawUrl, target, p.scheme), p.host, target, "force-host");
     }
     return null;
   }
@@ -567,7 +584,10 @@
   }
 
   function emptyStats() {
-    return { calls: 0, signals: 0, rewrites: 0, liveDropped: 0, last: null, lastNotifyAt: 0 };
+    return {
+      calls: 0, signals: 0, rewrites: 0, liveDropped: 0,
+      mediaCalls: 0, mediaRewrites: 0, last: null, lastNotifyAt: 0
+    };
   }
 
   function loadStats() {
@@ -597,6 +617,17 @@
     if (cfg.debug && stats.count && (Date.now() - (state.lastNotifyAt || 0)) > DEBUG_NOTIFY_MS) {
       state.lastNotifyAt = Date.now();
       notifyRewrite(stats, bestHost(cfg, rank));
+    }
+    writeStore(K_STATS, JSON.stringify(state));
+  }
+
+  // 媒体层每条分片都会调用一次，所以只做一次 read+write，也不参与通知限流。
+  function recordRequest(cfg, hit) {
+    var state = loadStats();
+    state.mediaCalls += 1;
+    if (hit) {
+      state.mediaRewrites += 1;
+      state.last = { reason: hit.reason, from: hit.from, to: hit.to, at: Date.now() };
     }
     writeStore(K_STATS, JSON.stringify(state));
   }
@@ -702,7 +733,10 @@
   }
 
   function shorten(host) {
-    return String(host).replace(/\.bilivideo\.com$/, "").replace(/^upos-/, "");
+    return String(host)
+      .replace(/\.bilivideo\.(com|cn|net)$/, "")
+      .replace(/\.akamaized\.net$/, "")
+      .replace(/^upos-/, "");
   }
 
   function reasonLabel(reason) {
@@ -840,21 +874,44 @@
       lines.push(note ? note : "点刷新按钮立即测速");
     }
 
-    lines.push("触发 " + state.calls + " 次 · 含媒体 " + state.signals + " 次 · 改写 " +
-      state.rewrites + " 处" + (state.liveDropped ? " · 直播剔除 " + state.liveDropped : ""));
+    lines.push("接口 触发 " + state.calls + " · 媒体 " + state.signals + " · 改写 " + state.rewrites);
+    lines.push("分片 " + state.mediaCalls + " 次 · 改写 " + state.mediaRewrites + " 处" +
+      (state.liveDropped ? " · 直播剔除 " + state.liveDropped : ""));
     if (state.last) {
       lines.push("最近 " + reasonLabel(state.last.reason) + "：" +
         shorten(state.last.from) + " → " + shorten(state.last.to));
     }
 
-    // 三个数字对应三种不同的故障，只有第一个是 MitM 没生效。混在一起报「命中 0 次」
-    // 时，用户无法区分自己该去查 MitM 还是该去查播放的客户端。
-    if (state.rewrites > 0) style = "good";
-    else if (state.calls === 0) lines.push("脚本未触发：检查 MitM 列表与证书");
-    else if (state.signals === 0) lines.push("脚本已触发但响应里没有媒体地址");
-    else lines.push("有媒体地址但无需改写");
+    // 接口层要 MitM 才看得到（网页版 playurl）；分片层看的是明文 http，不需要 MitM，
+    // App 只有后者覆盖得到。两个计数器分开，才能分辨是配置问题还是客户端不走这条路。
+    if (state.rewrites > 0 || state.mediaRewrites > 0) style = "good";
+    else if (state.calls === 0 && state.mediaCalls === 0) lines.push("未收到任何流量：检查模块版本与 MitM");
+    else if (state.calls > 0 && state.signals === 0) lines.push("接口已触发但响应里没有媒体地址");
+    else lines.push("有流量但无需改写");
 
     done({ title: panelTitle(), content: lines.join("\n"), style: style });
+  }
+
+  // 明文 HTTP 的分片请求走这一支：不需要 MitM，所以官方 App 也覆盖得到（它的
+  // playurl 是 gRPC/protobuf，payload 改写碰不到，但它的分片是 http）。
+  function runRequest(cfg) {
+    try {
+      var url = ($request && $request.url) || "";
+      if (!cfg.enabled || cfg.mode === "off" || !cfg.mediaRewrite) return done();
+
+      var p = parseUrl(url);
+      if (!p || !isMediaPath(p) || isLivePath(p)) return done();
+
+      var hit = rewriteOne(url, cfg, loadRank(cfg));
+      recordRequest(cfg, hit);
+      if (!hit) return done();
+
+      if (cfg.debug) log("request: " + hit.reason + " " + hit.from + " -> " + hit.to);
+      done({ url: hit.url });
+    } catch (e) {
+      log("request: failed, passing through (" + (e && e.message) + ")");
+      done();
+    }
   }
 
   function responseHeaders() {
@@ -931,13 +988,14 @@
     }
   }
 
+  // 角色按上下文判定，不按 $script.type：面板带 $input.purpose，响应脚本带 $response，
+  // 请求脚本带 $request，剩下的就是测速。精确匹配类型字符串会把一次改名变成静默失效。
   if (typeof $input !== "undefined" && $input && $input.purpose === "panel") {
     runPanel(loadConfig());
   } else if (typeof $response !== "undefined" && $response) {
     runResponse(loadConfig());
   } else if (SCRIPT_TYPE === "http-request") {
-    log("probe: refusing to run as an http-request script");
-    done();
+    runRequest(loadConfig());
   } else {
     try {
       runCron(loadConfig());

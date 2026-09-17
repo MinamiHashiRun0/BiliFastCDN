@@ -15,31 +15,38 @@ Surge iOS 模块：劫持 B 站 `playurl` / 直播 `playinfo` 接口，把视频
 - 移植范围：CDN 主机分类判定、候选节点池、直播 `url_info` 过滤、`backupUrl` 扇出、force / bad-only 语义、`/live-bvc/` 排除规则
 - 完整署名与上游许可全文：[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
 
-**未在真机验证。** 脚本逻辑有 228 项离线断言覆盖（含与上游逐条对照），但模块安装、MitM 证书、`cronexp` 触发、`[Panel]` 段落是否被 Surge 接受，都只有在设备上才能确认。使用前请自行审阅。
+**真机验证范围。** 脚本逻辑有 257 项离线断言覆盖（含与上游逐条对照）；模块安装、`[Panel]` 段落、分片层改写已在真机上确认可用。MitM 证书、`cronexp` 触发与各客户端的具体行为仍需自行确认。
 
 ---
 
 ## 它做什么
 
 ```
-Surge MitM（只覆盖 API 域名）
+Surge（接口层需要 MitM，分片层不需要）
         │
-        ├─ 改写层  http-response：解析 playurl / getRoomPlayInfo 的 JSON，
-        │          把媒体域名换成排名第一的节点
+        ├─ 接口层  http-response：解析 playurl / getRoomPlayInfo 的 JSON，
+        │          把媒体域名换成排名第一的节点（网页版走这条）
+        │
+        ├─ 分片层  http-request：改写明文 http 的分片请求
+        │          （官方 App 走这条）
         │
         └─ 测速层  cron（默认每 30 分钟检查、结果满 6 小时才重测）：
                    用真实签名分片做 Range 请求测吞吐，排名写入 $persistentStore
 ```
 
-**视频流本身不在 MitM 列表里。** 只有那一个 JSON 接口被解密改写，播放器仍按改写后的地址直接拉流，4K 不会因为 MitM 掉速。
+**为什么需要分片层**：官方 App 的 playurl 走 gRPC（protobuf），接口改写碰不到；但它的分片是**明文 http**，Surge 不做 MitM 也能看到并改写。真机 HAR 显示 App 的分片落在 `upos-hz-mirrorakam.akamaized.net`，把 host 换成测速最快的 `upos-sz-mirroraliov` 后**播放正常** —— URL 上的 `upsig`/`uparams` 校验通过，Akamai 的 `hdnts` token 被忽略。
+
+**视频流不做 MitM。** 分片层处理的是明文 http，接口层只解密那一个 JSON 接口，两者都不让 Surge 参与视频流加解密，4K 不会掉速。
+
+**仍未覆盖**：B站的 P2P 通道（`*.solseed.cn` tracker）不是 HTTP，Surge 无法改写。
 
 ## 文件
 
 | 文件 | 说明 |
 | --- | --- |
 | `BiliFastCDN.sgmodule` | 模块本体：`[Script]` / `[Panel]` / `[MITM]` / 参数表 |
-| `bili-cdn.js` | 一个文件三种角色：改写 / 测速 / 面板，按运行上下文分派 |
-| `test/verify.html` | 离线验证套件，232 项断言，用浏览器跑 |
+| `bili-cdn.js` | 一个文件四种角色：接口改写 / 分片改写 / 测速 / 面板，按运行上下文分派 |
+| `test/verify.html` | 离线验证套件，257 项断言，用浏览器跑 |
 | `LICENSE` | MIT |
 | `THIRD-PARTY-NOTICES.md` | 上游 realzza/bilibili-accelerator 的 MIT 署名 |
 
@@ -78,6 +85,7 @@ Surge MitM（只覆盖 API 域名）
 | --- | --- | --- |
 | `enabled` | `true` | 总开关 |
 | `mode` | `smart` | `smart` 有测速结果时全量改写、无结果时只动劣质节点；`force` 总是改写；`bad-only` 只改写 PCDN / 劣质节点；`off` 关闭改写 |
+| `mediaRewrite` | `true` | 是否启用明文 http 分片改写（官方 App 只有这层覆盖得到） |
 | `backupFanout` | `true` | 把候选节点写进 `backupUrl`，让播放器自己也能容错切换 |
 | `liveFilter` | `true` | 从直播 `url_info` 中剔除 PCDN 节点 |
 | `notify` | `true` | 测速完成后发通知 |
@@ -91,20 +99,23 @@ Surge MitM（只覆盖 API 域名）
 **看面板。** 策略选择页的「B站CDN」卡片：
 
 ```
-目标 tf-all-hw · 41.9 Mbps
-测速 12 分钟前 · 8 个节点
-触发 12 次 · 含媒体 9 次 · 改写 27 处 · 直播剔除 3
-最近 全量改写：sz-mirrorcos → tf-all-hw
+目标 sz-mirroraliov · 72.3 Mbps
+测速 1 分钟前 · 8 个节点
+接口 触发 12 · 媒体 9 · 改写 27
+分片 156 次 · 改写 150 处
+最近 全量改写：hz-mirrorakam → sz-mirroraliov
 ```
 
-三个计数器是排查用的，含义各不相同：
+两行计数对应两层，分开计就是为了定位问题：
 
 | 现象 | 含义 |
 | --- | --- |
-| 触发 0 次 | 改写脚本从未被执行 → MitM 没生效。确认 MitM 主机列表里有 `api.bilibili.com`、证书已在「设置 → 通用 → 关于本机 → 证书信任设置」里被信任、`auto-quic-block` 没被关掉 |
-| 触发 >0、含媒体 0 次 | 脚本跑了，但响应体里没有媒体地址 → 这个接口不是 playurl（例如用的是官方 App 的 gRPC 接口），或接口返回了错误 |
-| 含媒体 >0、改写 0 处 | 读到了媒体地址但无需改写（`bad-only` 下的正常状态） |
-| 改写 >0 处 | 生效了 |
+| 分片 改写 >0 | **分片层生效**（官方 App 走这条，不需要 MitM） |
+| 接口 改写 >0 | 接口层生效（网页版 playurl 走这条，需要 MitM） |
+| 接口 触发 0、分片 >0 | App 场景：playurl 是 gRPC 所以接口层看不到，正常 |
+| 两层都 0 | 没有任何 B 站流量到达脚本 → 先看面板标题的版本号，再查 MitM |
+| 接口 触发 >0、媒体 0 | 接口被触发了但响应体里没有媒体地址（该接口不是 playurl，或接口报错） |
+| 有流量、改写 0 | 无需改写（`bad-only` 下的正常状态） |
 
 点卡片右上角刷新按钮 = **立即重测**，不用等 30 分钟的定时任务。面板自身刷新（含自动刷新）只读已存结果，不发请求。
 
@@ -118,16 +129,17 @@ Surge MitM（只覆盖 API 域名）
 2. **MitM 主机列表**：Surge → MitM，确认里面有 `api.bilibili.com`。模块用 `%APPEND%` 追加；
    日志里出现 `Updating core settings, sections: ... MITM` 就代表 MITM 段已应用。
 3. **证书要「信任」而不只是「安装」**：设置 → 通用 → 关于本机 → 证书信任设置 → 打开 Surge 的开关。
-4. **换客户端试**：用 Safari 打开 `www.bilibili.com` 播一个视频。**官方 App 的 playurl 走 gRPC（protobuf），本模块不覆盖**，
-   App 里永远是 0 次 —— 这不是配置错误。
+4. **分清是哪一层为 0**：接口层为 0 而分片层有数字，就是 App 场景（playurl 走 gRPC），不是故障。
+   两层都为 0 才需要继续查。
 5. **QUIC**：确认 profile 里没有 `auto-quic-block = false`。该值默认 `true`，会把命中 MitM 列表的 HTTP/3 连接挡掉，
    让客户端回退到 h2/h1.1 才能被解密；关掉它 = B 站走 HTTP/3 时完全绕过 MitM。
-6. **证书校验（pinning）**：Surge 日志里出现
-   `Client closed connection without sending any request over the MitM connection, it might because of certificate pinning`
-   说明客户端拒绝了 Surge 的证书。可先在 profile 的 `[MITM]` 段加 `h2 = true` 试试（该键模块无法设置，只能写在主配置里）；
-   若仍然如此，说明这个客户端确实做了 pinning，只能用网页版。
-   同时注意：这类客户端在装上本模块后可能出现接口报错 / 登录异常，那就把 `[MITM]` 里对应域名删掉。
-7. **`client-source-address`**：如果 profile 限制了这个值且不含本机地址，本机自己发出的流量不会被解密。
+6. **`skip-server-cert-verify` 不是这个问题的解**。手册原文：它只 "relaxes verification of the real server"，
+   即放宽 **Surge → 源站** 的校验，客户端拿到的始终是 Surge 签发的证书 —— 所以它既不会导致、也治不好
+   客户端侧的连接中断。B站用公共可信证书，保持关闭（`false`）即可。
+7. **`MITM failed ... certificate pinning` 要看清是不是真的**：这条消息也会出现在**空闲/预热连接**上
+   （例如 TLS 握手完成后 60 秒内没有请求就关闭）。判断依据是 HAR：如果同一个 host 的其他请求返回 200，
+   说明 MitM 本身是通的，那这条只是被丢弃的连接，不是故障。
+8. **`client-source-address`**：如果 profile 限制了这个值且不含本机地址，本机自己发出的流量不会被解密。
 
 **看日志。** 打开 `debug` 后：
 
@@ -136,9 +148,10 @@ Surge MitM（只覆盖 API 域名）
 [BiliFastCDN] response: https://api.bilibili.com/x/player/playurl bytes=41337 signal=true code=0 rewrites=2 {"force-host":1} target=upos-tf-all-hw.bilivideo.com
 [BiliFastCDN]   force-host upos-sz-mirrorcos.bilivideo.com -> upos-tf-all-hw.bilivideo.com
 [BiliFastCDN] response: https://api.bilibili.com/x/player/playurl bytes=41 signal=false
+[BiliFastCDN] request: force-host upos-hz-mirrorakam.akamaized.net -> upos-tf-all-hw.bilivideo.com
 ```
 
-最后一行是「脚本跑到了，但响应体里没有媒体地址」的形态。排查顺序：先看有没有 `response:` 行（没有就是 MitM 没生效），再看 `signal`。
+第二行那条 `signal=false` 是「脚本跑到了，但响应体里没有媒体地址」的形态；最后一行是分片层的一次改写。排查顺序：先看有没有 `response:` / `request:` 行（都没有就是两层都没看到流量），再看 `signal`。
 
 日志里只有域名、没有签名 query（`sign` / `deadline` / `oi` 一律不落盘），可以安全贴出来求助。
 
@@ -147,18 +160,23 @@ Surge MitM（只覆盖 API 域名）
 | 方面 | bilibili-accelerator | 本项目 |
 | --- | --- | --- |
 | 运行环境 | 浏览器 userscript | Surge iOS 模块 |
-| 拦截点 | 页面 `fetch` / `XHR` / `JSON.parse` | API 响应体改写（对任意 App 生效，不限浏览器） |
+| 拦截点 | 页面 `fetch` / `XHR` / `JSON.parse` | API 响应体改写 + 明文 http 分片改写 |
 | 测速时机 | 播放时实时探测 | cron 后台任务 + 面板手动触发 |
 | 测速请求 | `fetch`，读满 768KB 后中断 | `$httpClient` + `Range`，恰好 1MB |
 | 界面 | 页面浮层面板、速度曲线 | Surge 信息面板（无曲线） |
-| 未移植 | — | 速度曲线、沉浸模式 CSS、P2P Guard（WebRTC）、配置桥 |
+| 未移植 | — | 速度曲线、沉浸模式 CSS、P2P Guard（WebRTC，Surge 侧无对应手段）、配置桥 |
 
 必须改的原因：Surge 不允许在 http-request 里做异步，也无法用 `fetch` / `ReadableStream`；
 把 playurl 响应阻塞几秒比"排名晚几小时"更糟，所以测速被拆到 cron。
 
 ## 已知限制
 
-- **官方客户端 gRPC 接口**（`grpc.biliapi.net`）是 protobuf，脚本无法解析，因此只覆盖 HTTP 接口；App 内部分流量可能仍走原始节点。
+- **官方 App 的 playurl 是 gRPC**（`grpc.biliapi.net`，protobuf），接口层解析不了 —— 但 App 的分片是明文 http，
+  由分片层覆盖，所以 App 场景实际是生效的（真机已验证）。反过来说：如果某个客户端的 playurl 走 HTTPS（而非明文 http），
+  分片层也看不到它，那就只剩接口层可用。
+- **分片层没有 backupUrl 兜底**。接口层改写失败时播放器还能靠 `backupUrl` 换节点；分片层是逐个请求改写，
+  目标节点若不可用就是分片失败。所以分片层的策略与接口层一致（`smart` 有排名时才全量改写），
+  出问题时可以单独关掉 `mediaRewrite`。
 - **直播**（`/live-bvc/`）只做 PCDN 剔除，不做域名替换 —— 那是另一套 CDN 层级，换域名会直接把直播打死。
 - **MitM 会解密 `api.bilibili.com`**。若某客户端做了证书校验（出现接口报错、登录异常），把 `[MITM]` 里对应域名去掉即可；模块本身不会失效，只是那些接口不再被改写。
 - **签名分片 URL 会过期**。测速样本过期时该轮会退回纯延迟排序（面板会标注"仅延迟测速"）。
