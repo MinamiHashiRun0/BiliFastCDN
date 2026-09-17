@@ -11,7 +11,7 @@
   var K_STATS = "bili_fast_cdn.stats.v1";
 
   // Surge 对远程脚本默认缓存 86400 秒，面板标题带版本号才能确认设备上跑的是哪一版。
-  var VERSION = "0.2.0";
+  var VERSION = "0.3.0";
   var PANEL_TITLE = "B站CDN";
   var REASON_LABELS = {
     "force-host": "全量改写",
@@ -62,6 +62,10 @@
     mediaRewrite: true,
     // gRPC（protobuf）响应改写：App 的 playurl 走这里。
     grpcRewrite: true,
+    // App 的 playurl 响应实测全是 gzip 帧，不解压就一次也改不动。默认关：改写后只能
+    // 按"未压缩帧"发回去（`$utils` 只有 ungzip，没有 gzip），万一某个客户端只认压缩帧，
+    // 整条 playurl 会失败 —— 这个风险交给用户显式打开。
+    grpcGunzip: false,
     rankTtlMs: 6 * 60 * 60 * 1000,
     sampleTtlMs: 90 * 60 * 1000,
     // 注意单位：Surge $httpClient 的 timeout 是秒，本文件其余 TTL 是毫秒。
@@ -73,6 +77,7 @@
     backup_fanout: "backupFanout",
     media_rewrite: "mediaRewrite",
     grpc_rewrite: "grpcRewrite",
+    grpc_gunzip: "grpcGunzip",
     host_pcdn: "hostPcdn",
     host_oversea: "hostOversea",
     host_bstar: "hostBStar",
@@ -188,6 +193,7 @@
     cfg.backupFanout = asBool(cfg.backupFanout, DEFAULTS.backupFanout);
     cfg.mediaRewrite = asBool(cfg.mediaRewrite, DEFAULTS.mediaRewrite);
     cfg.grpcRewrite = asBool(cfg.grpcRewrite, DEFAULTS.grpcRewrite);
+    cfg.grpcGunzip = asBool(cfg.grpcGunzip, DEFAULTS.grpcGunzip);
     cfg.hostPcdn = asHost(cfg.hostPcdn, DEFAULTS.hostPcdn);
     cfg.hostOversea = asHost(cfg.hostOversea, DEFAULTS.hostOversea);
     cfg.hostBStar = asHost(cfg.hostBStar, DEFAULTS.hostBStar);
@@ -325,7 +331,13 @@
       schedulerSource: schedulerSource,
       mcdn: isMcdnHost(h),
       akamai: /\.akamaized\.net$/i.test(h),
-      pcdn: IP_RE.test(h) || XY_MCDN_RE.test(h) || isKnownP2pHost(h) ||
+      // 裸 IP 不算劣质节点。上游是把 ipLike 当 PCDN 的，但它在浏览器里跑，播放器有
+      // backup_url 和卡顿恢复；这里一旦判成劣质就会把播放器正在用的那条 URL 换掉。
+      // 实测（2026-09-18 HAR）：App 的 playurl 会下发裸 IP 形式的 CDN 地址
+      // （203.121.59.225 = upos-hz-mirrorakam 的 Akamai 边缘，92.223.116.254 = cosov 的
+      // G-Core 边缘，os= 参数分别就是 akam / cosovbv），那是 App 自己做 HTTPDNS 的结果，
+      // 不是 P2P；按"劣质"改写反而把能用的地址换成了打不开的主机名。
+      pcdn: XY_MCDN_RE.test(h) || isKnownP2pHost(h) ||
         (cfg.portHeuristic && hasNonDefaultPort(p)) || hasMcdnQuery(p)
     };
   }
@@ -988,6 +1000,7 @@
     if (state.grpcLast) {
       var gl = state.grpcLast;
       gTail = " · 最近 " + humanBytes(gl.bytes) + " 帧" + gl.frames + " 改写" + gl.rewrites +
+        (gl.unzipped ? " 解压" + gl.unzipped : "") +
         (gl.compressed ? " 压缩" + gl.compressed : "") + (gl.framed ? "" : " 非帧");
     }
     lines.push("gRPC 扫描" + state.grpcCalls + " 改写" + state.grpcRewrites + gTail);
@@ -1119,7 +1132,8 @@
   function shouldMoveHost(host, cfg, rank) {
     if (host === targetFor(cfg, rank, host)) return false;
     if (isMcdnHost(host) && cfg.mcdnStrategy !== "off") return true;
-    if (isKnownP2pHost(host) || IP_RE.test(host) || XY_MCDN_RE.test(host)) return true;
+    // 裸 IP 不换：那是 App 用 HTTPDNS 拿到的 CDN 边缘地址，不是 P2P 节点，判据同 classify。
+    if (isKnownP2pHost(host) || XY_MCDN_RE.test(host)) return true;
     if (/\.akamaized\.net$/i.test(host)) return cfg.rewriteAkamai;
     // 用户明确指定了该分类的目标（不是 auto）时，健康节点也照换 —— 那是显式意图。
     if (pinnedFor(cfg, host)) return true;
@@ -1261,6 +1275,7 @@
     var changed = false;
     var frames = 0;
     var compressed = 0;
+    var unzipped = 0;
 
     while (pos + 5 <= buf.length) {
       var flag = buf[pos];
@@ -1270,15 +1285,27 @@
       frames += 1;
 
       if (flag !== 0) {
-        // 压缩帧（通常是 gzip）：替换后无法重新压缩，原样保留这帧
         compressed += 1;
-        for (var q = pos; q < payEnd; q++) segs.push(buf[q]);
+        var plain = cfg.grpcGunzip ? gunzipPayload(buf, pos + 5, payEnd) : null;
+        var subC = plain ? walkMessage(plain, 0, plain.length, cfg, rank, stats, 0) : null;
+        if (subC && subC.out) {
+          // 解压后改写了，就没法再压回去（Surge 只有 ungzip）—— 按"未压缩帧"发回去。
+          // gRPC 的压缩标志是逐帧的（flag=0 表示这帧没压缩），客户端必须两种都收。
+          var nlC = int32Bytes(subC.out.length);
+          segs.push(0);
+          for (var c = 0; c < 4; c++) segs.push(nlC[c]);
+          for (c = 0; c < subC.out.length; c++) segs.push(subC.out[c]);
+          changed = true;
+          unzipped += 1;
+        } else {
+          for (var f = pos; f < payEnd; f++) segs.push(buf[f]);
+        }
       } else {
         var sub = walkMessage(buf, pos + 5, payEnd, cfg, rank, stats, 0);
         if (sub.out) {
           var nl = int32Bytes(sub.out.length);
           segs.push(flag);
-          for (q = 0; q < 4; q++) segs.push(nl[q]);
+          for (var q = 0; q < 4; q++) segs.push(nl[q]);
           for (q = 0; q < sub.out.length; q++) segs.push(sub.out[q]);
           changed = true;
         } else {
@@ -1288,9 +1315,22 @@
       pos = payEnd;
     }
 
-    if (pos !== buf.length) return { out: null, frames: frames, compressed: compressed, framed: false };
-    if (!changed) return { out: null, frames: frames, compressed: compressed, framed: true };
-    return { out: new Uint8Array(segs), frames: frames, compressed: compressed, framed: true };
+    if (pos !== buf.length) return { out: null, frames: frames, compressed: compressed, unzipped: 0, framed: false };
+    if (!changed) return { out: null, frames: frames, compressed: compressed, unzipped: 0, framed: true };
+    return { out: new Uint8Array(segs), frames: frames, compressed: compressed, unzipped: unzipped, framed: true };
+  }
+
+  // 官方 App 的 playurl 响应实测 100% 是压缩帧（5/5：2990B gzip → 12476B message），
+  // 所以字节层在默认配置下其实一次也改不动 —— 这条路径得先解开 gzip。
+  function gunzipPayload(buf, start, end) {
+    if (typeof $utils === "undefined" || !$utils || typeof $utils.ungzip !== "function") return null;
+    if (end - start < 2 || buf[start] !== 0x1f || buf[start + 1] !== 0x8b) return null;
+    var copy = new Uint8Array(end - start);
+    for (var i = start; i < end; i++) copy[i - start] = buf[i] & 255;
+    try {
+      var out = $utils.ungzip(copy);
+      return out && out.length ? out : null;
+    } catch (e) { return null; }
   }
 
   function responseHeaders() {
@@ -1322,7 +1362,7 @@
         var gstats = { count: 0, reasons: {}, details: [], signal: true, binary: true, grpcRewrites: 0 };
         var gRank = loadRank(cfg);
 
-        var gres = { out: null, frames: 0, compressed: 0, framed: false };
+        var gres = { out: null, frames: 0, compressed: 0, unzipped: 0, framed: false };
         if (cfg.grpcRewrite) {
           gres = rewriteGrpcBody(bytes, cfg, gRank, gstats);
           out = gres.out;
@@ -1332,6 +1372,7 @@
           bytes: bytes.length,
           frames: gres.frames,
           compressed: gres.compressed,
+          unzipped: gres.unzipped,
           framed: gres.framed
         };
         recordResponse(cfg, gstats, false, gRank);
@@ -1339,6 +1380,7 @@
         if (cfg.debug) {
           log("grpc: " + reqUrl.split("?")[0] + " bytes=" + bytes.length +
             " frames=" + gres.frames + (gres.compressed ? " compressed=" + gres.compressed : "") +
+            (gres.unzipped ? " unzipped=" + gres.unzipped : "") +
             (gres.framed ? "" : " not-framed") +
             " rewrites=" + gstats.grpcRewrites);
           for (var gi = 0; gi < gstats.details.length && gi < MAX_LOGGED_DETAILS; gi++) {

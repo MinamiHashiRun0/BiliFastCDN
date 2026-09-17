@@ -18,14 +18,18 @@ Surge iOS 模块：劫持 B 站 `playurl` / 直播 `playinfo` 接口，把视频
   **字节级 protobuf 改写器与全部判定实现均为本项目自写，未复制其代码**
 - 完整署名与上游许可全文：[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
 
-**真机验证范围。** 脚本逻辑有 317 项离线断言覆盖（含与上游逐条对照与合成 protobuf fixture）。
-已在真机确认：模块安装、`[Panel]` 段落、分片层能截到明文 http 分片请求。
-但**「换到测速最快的节点就一定更快」这个前提被真机推翻过一次**：同一条分片的主备候选被一起换到排名第一的节点后，
-那个节点在本地解析不到（403），主备一起失败，视频直接放不出来 —— v0.2.0 因此把分片层在 `smart` 下退化成"只修劣质节点"，
-原因与证据见「已知限制」。
-gRPC 层真机已确认一半：**默认引擎确实交付了 Uint8Array body**（真机 `gRPC 触发 13 次`），
-但当时 `改写 0 次` —— 根因是 body 是 gRPC **帧**序列而非裸 protobuf，解析器在第一个字节（压缩标志位）就放弃了，
-v0.1.5 已修（见「已知限制」）。修正后的改写效果仍待真机确认；出问题可以单独关 `grpcRewrite`。
+**真机验证范围。** 脚本逻辑有 327 项离线断言覆盖（含与上游逐条对照与合成 protobuf fixture）。
+已在真机确认：模块安装、`[Panel]` 段落、分片层能截到明文 http 分片请求、debug 输出落在请求注释里。
+两次真机事故都进了回归测试：
+
+1. 分片层把一条分片的主备候选一起换到排名第一的节点，而该主机名在本地解析到不服务它的边缘
+   （`403 X-Tengine-Error: non-existent domain`）→ 主备全灭、播不了。v0.2.0 起 `smart` 下分片层只修劣质节点。
+2. 分片层把 App 下发的**裸 IP 形式** CDN 地址当 PCDN，换成主机名 → 403。裸 IP 是 App 自己做 HTTPDNS
+   的结果（`203.121.59.225` = akam 边缘、`92.223.116.254` = cosov 边缘），不是 P2P；v0.3.0 起不再动它。
+
+**gRPC 层真机已确认两件事**：默认引擎确实交付 Uint8Array body；而 App 的 playurl 响应**全是 gzip 帧**
+（实测 5/5，2990B 解压出 12476B message）—— 所以不解压就一次也改不动，`grpcGunzip` 是为此加的开关（默认关，
+原因见「已知限制」）。`gRPC 触发 13 次 / 改写 0 次` 那句老现象到这里就算解释完了。
 
 ## 它做什么
 
@@ -59,6 +63,11 @@ gRPC 层（字节层）与分片层在 `smart` 下**只清劣质节点，不碰�
 没有该域名的阿里云边缘，每条请求都是 `403 X-Tengine-Error: non-existent domain`。当时一条分片的主备候选
 （akam 与 cosov）都被收敛到了这一个主机名，于是主备一起 403，整集放不出来。这就是分片层不再全量改写的原因。
 
+**裸 IP 不是劣质节点**。App 的 playurl 会下发 IP 形式的 CDN 地址（实测 `203.121.59.225` 是
+`upos-hz-mirrorakam` 的 Akamai 边缘、`92.223.116.254` 是 cosov 的 G-Core 边缘，`os=` 参数分别就是 `akam` / `cosovbv`）——
+那是 App 自己做 HTTPDNS 拿到的结果，不是 P2P。上游把 `ipLike` 当 PCDN 判（浏览器里有 `backup_url` 和卡顿恢复兜底），
+我们照搬过一次，代价是把能用的地址换成了打不开的主机名（403）。**这是与上游有意不同的一处**，离线套件里单独断言。
+
 **视频流不做 MitM。** 分片层处理的是明文 http，gRPC 层与接口层只解密接口响应，都不让 Surge 参与视频流加解密。
 
 **仍未覆盖**：B站的 P2P 通道（`*.solseed.cn` tracker）不是 HTTP，Surge 无法改写。
@@ -69,7 +78,7 @@ gRPC 层（字节层）与分片层在 `smart` 下**只清劣质节点，不碰�
 | --- | --- |
 | `BiliFastCDN.sgmodule` | 模块本体：`[Script]` / `[Panel]` / `[MITM]` / 参数表 |
 | `bili-cdn.js` | 一个文件四种角色：接口改写 / 分片改写 / 测速 / 面板，按运行上下文分派 |
-| `test/verify.html` | 离线验证套件，317 项断言，用浏览器跑 |
+| `test/verify.html` | 离线验证套件，327 项断言，用浏览器跑 |
 | `LICENSE` | MIT |
 | `THIRD-PARTY-NOTICES.md` | 上游 realzza/bilibili-accelerator 的 MIT 署名 |
 
@@ -82,6 +91,7 @@ gRPC 层（字节层）与分片层在 `smart` 下**只清劣质节点，不碰�
 | `enabled` | `true` | 总开关 |
 | `mode` | `smart` | `smart` 接口层全量改写、gRPC 层与分片层只动劣质节点；`force` 三层都全量改写（分片层全量会让播放器失去主备冗余，慎用）；`bad-only` 只改写 PCDN / 劣质节点；`off` 关闭改写 |
 | `grpcRewrite` | `true` | 是否启用 gRPC（protobuf）响应改写 |
+| `grpcGunzip` | `false` | 是否先解开 gzip 帧再改 gRPC。App 的 playurl 实测全是 gzip 帧，不开则字节层一次也改不动；开启后改写过的帧按未压缩帧发回，客户端不认就会整条 playurl 失败，所以默认关 |
 | `mediaRewrite` | `true` | 是否启用明文 http 分片改写（官方 App 只有这层覆盖得到） |
 | `hostPcdn` / `hostOversea` / `hostBStar` | `auto` | 分类目标覆盖。`auto` = 用测速排名第一；填主机名则固定用它。分类按**来源主机名**判定：`upos-sz-mirror*ov` 与 `cn-hk-eq-*` 属港澳台，`*bstar1` 属国际版，其余按大陆 |
 | `hostMcdn` | `proxy-tf-all-ws.bilivideo.com` | MCDN 的目标节点（默认代理包裹，与 realzza、Biliverse/Redirect 两者的默认一致） |
@@ -128,15 +138,17 @@ gRPC 那行尾巴是最近一次的**帧结构**，改写为 0 时靠它定位�
 
 | 尾巴里出现 | 含义 |
 | --- | --- |
-| `压缩N` | 有 N 个压缩帧（通常是 gzip），替换后无法重新压缩，只能放行 |
+| `压缩N` | 有 N 个压缩帧（通常是 gzip）。默认不解压，只能整帧放行；开了 `grpcGunzip` 且改动了就是 `解压N` |
+| `解压N` | N 个压缩帧被解开并改写，且按未压缩帧发回（`grpcGunzip=true` 才会出现） |
 | `非帧` | body 不是 gRPC 帧结构（可能不是本模块该管的响应） |
-| 都没有、且 `改写0` | 真的没有可换的主机名（例如 URL 用的是裸 IP 形式的 PCDN 节点） |
+| 都没有、且 `改写0` | 真的没有可换的主机名 |
 
 三层计数分开计就是为了定位问题：
 
 | 现象 | 含义 |
 | --- | --- |
 | gRPC 改写 >0 | **gRPC 层生效**（官方 App 的 playurl 走这条，需要 MitM） |
+| gRPC 扫描 >0、改写 0、`压缩N` | 响应是 gzip 帧，字节层解不开 —— 默认配置下 App 的 playurl 就是这个形态，要改写需开 `grpcGunzip` |
 | 分片 改写 >0 | 分片层生效（明文 http 分片，不需要 MitM） |
 | 分片 扫描 >0、改写 0 | `smart` 下的正常状态：分片层只修劣质节点，健康节点放过（卡片会写这行） |
 | 接口 改写 >0 | 接口层生效（网页版 JSON playurl 走这条） |
@@ -147,23 +159,33 @@ gRPC 那行尾巴是最近一次的**帧结构**，改写为 0 时靠它定位�
 点卡片右上角刷新按钮 = **立即重测**，不用等 30 分钟的定时任务。面板自身刷新（含自动刷新）只读已存结果，不发请求。
 
 **看 debug 输出。** 先看上面的面板 —— 三层计数与 gRPC 帧结构已经在那里，
-最常问的「为什么改写是 0」不用翻日志。要更细的逐条判定，打开 `debug` 后有三处落点：
+最常问的「为什么改写是 0」不用翻日志。要更细的逐条判定，打开 `debug` 后有两处落点：
 
-1. **面板**（不依赖任何设置，永远可用）
-2. **请求详情里的注释**：模块的 `[Script]` 行带了 `debug`，Surge 会把 `console.log` 放进该请求的注释。
-   到「请求记录」点开对应的 playurl / gRPC / 分片请求即可看到。
-3. **日志页面**：需要 `[General] loglevel = info`。该值默认为 `notify`，**脚本输出会被这一级过滤掉**
-   （`verbose` 没必要，官方说明它会明显影响性能）。
+1. **请求记录的「注释」——HTTP 脚本的输出只在这里**。Surge 手册对 `debug` 的说明是：
+   `console.log()` 输出 "also appears in the request's notes"。所以分片 / gRPC / 接口三条脚本的输出
+   **不在日志页**，要去「请求记录」点开那条请求看注释（导出的 HAR 里就是每个 entry 的 `comment` 字段）。
+2. **日志页**：只有**测速（cron）与面板**这两类脚本没有对应「请求」，它们的输出才落到日志页；
+   日志页还需要 `[General] loglevel = info`（默认 `notify` 会把脚本输出过滤掉，`verbose` 没必要）。
+   想立刻看到，点面板卡片的刷新按钮触发一次测速。
+
+真机日志里长这样（注释字段原文，一次会话里同时能看到三层）：
 
 ```
-[BiliFastCDN] probe: upos-tf-all-hw.bilivideo.com status=200 251ms 33.42Mbps
+[BiliFastCDN] grpc: https://grpc.biliapi.net/bilibili.app.playerunite.v1.Player/PlayViewUnite bytes=2995 frames=1 compressed=1 rewrites=0
 [BiliFastCDN] response: https://api.bilibili.com/x/player/playurl bytes=41337 signal=true code=0 rewrites=2 {"force-host":1} target=upos-tf-all-hw.bilivideo.com
 [BiliFastCDN]   force-host upos-sz-mirrorcos.bilivideo.com -> upos-tf-all-hw.bilivideo.com
-[BiliFastCDN] request: pcdn-host upos-sz-mirror14b.bilivideo.com -> upos-tf-all-hw.bilivideo.com
+[BiliFastCDN] request: pcdn-host 203.121.59.225 -> upos-sz-mirroraliov.bilivideo.com
+[BiliFastCDN] probe: upos-tf-all-hw.bilivideo.com status=200 251ms 33.42Mbps
 ```
 
-`signal=false` 是「脚本跑到了，但响应体里没有媒体地址」的形态。日志里只有域名、没有签名 query
-（`sign` / `deadline` / `oi` 一律不落盘），可以安全贴出来求助。
+三种要会看的形态：
+
+- `compressed=1 rewrites=0`：响应是 gzip 帧，字节层解不开 —— 默认配置下 App 的 playurl 永远停在这里（`grpcGunzip` 见上）。
+- `pcdn-host 203.121.59.225 -> …`：原始主机是**裸 IP**（App 自己做 HTTPDNS 的结果）。v0.3.0 起这种情况不再改写，
+  所以新日志里不会再出现以 IP 结尾的 `pcdn-host`。
+- `signal=false`：「脚本跑到了，但响应体里没有媒体地址」。
+
+日志里只有域名、没有签名 query（`sign` / `deadline` / `oi` 一律不落盘），可以安全贴出来求助。
 
 ## 与原项目的差异
 
@@ -174,6 +196,7 @@ gRPC 那行尾巴是最近一次的**帧结构**，改写为 0 时靠它定位�
 | 测速时机 | 播放时实时探测 | cron 后台任务 + 面板手动触发 |
 | 测速请求 | `fetch`，读满 768KB 后中断 | `$httpClient` + `Range`，恰好 1MB |
 | 界面 | 页面浮层面板、速度曲线 | Surge 信息面板（无曲线） |
+| 裸 IP 地址 | 当 PCDN 节点改写 | **不动它**（App 的 HTTPDNS 结果，改了会 403；浏览器侧有 backup/恢复兜底，Surge 侧没有） |
 | 未移植 | — | 速度曲线、沉浸模式 CSS、P2P Guard（WebRTC，Surge 侧无对应手段）、配置桥 |
 
 必须改的原因：Surge 不允许在 http-request 里做异步，也无法用 `fetch` / `ReadableStream`；
@@ -188,10 +211,13 @@ gRPC 那行尾巴是最近一次的**帧结构**，改写为 0 时靠它定位�
   必须按帧解析 —— 把整段当裸 message 的话第一字节（标志位）就会被判为非法 tag，一次都改不成（这个坑真机踩过：
   `gRPC 触发 13 次 / 改写 0 次`）。
 - **gRPC 层的三个边界**：
-  ① 压缩帧（标志位非 0，通常是 gzip）替换后无法重新压缩，只能原样保留，`debug` 日志会打 `compressed=N`；
+  ① 压缩帧（标志位非 0）：**实测 App 的 playurl 响应 100% 是这种**（5/5，2990B gzip → 12476B message）。
+  默认只能整帧放行，面板显示 `压缩N`；打开 `grpcGunzip` 后会用 `$utils.ungzip` 解开、改写，再把这一帧
+  按**未压缩帧**（flag=0）发回 —— gRPC 的压缩标志是逐帧的，客户端两种都该收，但万一某个客户端不认，
+  整条 playurl 会失败，所以这个开关默认关。Surge 只有 `ungzip`、没有 `gzip`，压不回去；
   ② 模块里那条 `max-size` 是缓冲上限，超过就整条跳过直接放行（iOS 上过大会占 NE 进程内存），默认 1MB 偏小，本模块设为 4MB；
   ③ 主机名锚点覆盖 `bilivideo.{com,cn,net}` / `akamaized.net` / 已知 PCDN 家族（`szbdyd.com`、`mountaintoys.cn` 等），
-  **裸 IP 形式的 PCDN 节点识别不了**（JSON 层可以，gRPC 层暂时没有）。
+  **裸 IP 形式的地址不会被动**（见上：那是 App 的 HTTPDNS 结果，改成主机名会 403）。
 - **gRPC 的 pattern 是按方法名收窄的**（`PlayViewUnite` / `PlayView` / `PlayConf` / `PlayURL`）。判定按 body 内容做、
   不按方法名写死，所以 B 站以后再把别的接口迁到 gRPC 时，只需把新方法名加进模块那条 pattern 即可。
 - **两条 pattern 不能重叠**：Surge 每个请求只跑第一条匹配的脚本。JSON 那条的 pattern 必须只写 JSON 端点路径
@@ -223,9 +249,14 @@ chrome --headless=new --disable-gpu --allow-file-access-from-files \
 
 输出 `ALL n CHECKS PASSED` 或失败明细。覆盖内容：
 
-- **与上游对照**：18 个 URL 的 `classify` 判定与 `rewriteUrlDetail` 改写结果，逐条与参考实现比对（把 `bilibili-accelerator.user.js` 放到 `test/fixtures/` 下即可启用，未放则跳过并标注）
+- **与上游对照**：18 个 URL 的 `classify` 判定与 `rewriteUrlDetail` 改写结果逐条比对（17 条要求一致，
+  裸 IP 那条是**有意偏离**，单独断言：上游判 PCDN、我们不判）；把 `bilibili-accelerator.user.js` 放到
+  `test/fixtures/` 下即可启用，未放则跳过并标注
 - 五个角色的端到端模拟：接口改写（force / bad-only / 关闭 / 直播 / 空载荷）、gRPC 改写、分片改写、测速（首次引导、样本过期回退、全部失败、结果缓存命中）、面板
 - 分片层策略：`smart` 下健康节点原样放过、一条分片的主备候选都保持原生、`force` 才全量改写、分类固定目标在 `smart` 下照办（这几条是对"主备一起 403 导致播不了"的回归）
+- 裸 IP 回归：分片层与字节层都不动 IP 形式的 CDN 地址（对"把 IP 当 PCDN 换掉导致 403"的回归）
+- gRPC gzip：默认不解压（整帧放行并计数）、`grpcGunzip` 开启后解压→改写→按未压缩帧发回、
+  解压失败 / `$utils` 缺失 / 返回值不是 message 三种情况都原样保留
 - 测速剔除留痕：403 的候选进不了排名、记进排名的 `rejected`、面板「剔除」尾巴能显示出主机名与状态码
 - 签名 query 必须逐字节保留；分片改写必须保持原 scheme；日志不得出现 token
 - 改写幂等（Surge 会对改写后的 URL 重跑脚本）
