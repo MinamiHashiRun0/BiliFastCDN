@@ -797,13 +797,14 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     const framed = (host) => new Uint8Array(frame(Array.from(mkBody(host))));
     const fresh = () => ({ count: 0, reasons: {}, details: [], grpcRewrites: 0 });
     const cfg = Object.assign({}, api.DEFAULTS, { mode: "smart" });
+    // 显式开了 rewriteAkamai 或指定了分类目标时，字节层才会动健康节点
+    const cfgMove = Object.assign({}, cfg, { rewriteAkamai: true, hostOversea: ALIOV });
     const ranked = { ranking: [ALIOV] };
     const cold = null;
 
     // Equal-length swap: only the host bytes change, every length prefix stays put.
-    const eq = api.rewriteProto(mkBody(COSOV), cfg, ranked, fresh());
     const eqStats = fresh();
-    const eq2 = api.rewriteProto(mkBody(COSOV), cfg, ranked, eqStats);
+    const eq2 = api.rewriteProto(mkBody(COSOV), cfgMove, ranked, eqStats);
     check("equal-length swap rewrites exactly one host", eqStats.grpcRewrites, 1);
     check("equal-length swap keeps the body size", eq2.length, mkBody(COSOV).length);
     check("the rewritten body parses back with the new host",
@@ -813,7 +814,7 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     // (both the nested message and the string field) must be rewritten too.
     const src = mkBody(AKAM);
     const st = fresh();
-    const out = api.rewriteProto(src, cfg, ranked, st);
+    const out = api.rewriteProto(src, cfgMove, ranked, st);
     check("unequal-length swap grows by exactly the host delta",
       out.length - src.length, ALIOV.length - AKAM.length);
     check("the resized body still parses back",
@@ -832,22 +833,28 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     // Policy mirrors the other layers: akamai only moves once something was measured.
     check("akamai is left alone before the first measurement",
       api.rewriteProto(mkBody(AKAM), cfg, cold, fresh()), null);
-    checkTrue("akamai moves once ranked",
-      api.rewriteProto(mkBody(AKAM), cfg, ranked, fresh()) !== null);
+    // 字节层默认不动健康节点：JSON 层能补 backupUrl，protobuf 补不了，收敛到单一 host
+    // 等于拆掉播放器的多 CDN 容错（一处抖动就卡一段）。"选最快"交给分片层。
+    check("the byte layer leaves a healthy mirror alone even when ranked",
+      api.rewriteProto(mkBody(COSOV), cfg, ranked, fresh()), null);
+    checkTrue("akamai moves once rewriteAkamai is on",
+      api.rewriteProto(mkBody(AKAM), cfgMove, ranked, fresh()) !== null);
+    checkTrue("a pinned category target moves healthy hosts too",
+      api.rewriteProto(mkBody(COSOV), cfgMove, ranked, fresh()) !== null);
     checkTrue("an mcdn host moves even without a ranking",
       api.rewriteProto(mkBody("xy1x2x3x4xy.mcdn.bilivideo.cn"), cfg, cold, fresh()) !== null);
 
     // Several URLs in one message all get rewritten.
     const multi = new Uint8Array([].concat(sfield(1, urlOf(COSOV)), sfield(2, urlOf(COSOV))));
     const mst = fresh();
-    api.rewriteProto(multi, cfg, ranked, mst);
+    api.rewriteProto(multi, cfgMove, ranked, mst);
     check("every occurrence in the message is swapped", mst.grpcRewrites, 2);
 
     // The real body is a stream of gRPC frames, not a bare message. Treating it as
     // a bare message makes the parser reject byte 0 (the flag) and rewrite nothing —
     // which is exactly what an on-device run showed (13 calls, 0 rewrites).
     const f1s = fresh();
-    const f1 = api.rewriteGrpcBody(framed(COSOV), cfg, ranked, f1s);
+    const f1 = api.rewriteGrpcBody(framed(COSOV), cfgMove, ranked, f1s);
     check("a gRPC frame is rewritten", f1s.grpcRewrites, 1);
     check("the frame stream is reported", [f1.frames, f1.compressed, f1.framed], [1, 0, true]);
     check("an equal-length swap keeps the frame size", f1.out.length, framed(COSOV).length);
@@ -855,7 +862,7 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
       stringsOf(f1.out.slice(5)), ["playurl-id", urlOf(ALIOV), "backup", "tail"]);
 
     const f2s = fresh();
-    const f2 = api.rewriteGrpcBody(framed(AKAM), cfg, ranked, f2s);
+    const f2 = api.rewriteGrpcBody(framed(AKAM), cfgMove, ranked, f2s);
     check("a resized frame grows by the host delta",
       f2.out.length - framed(AKAM).length, ALIOV.length - AKAM.length);
     check("the resized frame still parses back",
@@ -864,7 +871,7 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     const two = new Uint8Array([].concat(
       frame(Array.from(mkBody(COSOV))), frame(Array.from(mkBody(COSOV)))));
     const f3s = fresh();
-    const f3 = api.rewriteGrpcBody(two, cfg, ranked, f3s);
+    const f3 = api.rewriteGrpcBody(two, cfgMove, ranked, f3s);
     check("every frame is scanned", f3.frames, 2);
     check("every frame is rewritten", f3s.grpcRewrites, 2);
 
@@ -886,7 +893,7 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
       script: { type: "http-response" },
       request: { url: "https://grpc.biliapi.net/bilibili.app.playerunite.v1.Player/PlayViewUnite" },
       response: { status: 200, headers: {}, body: framed(COSOV) },
-      argument: "mode=smart",
+      argument: "mode=smart&hostOversea=upos-sz-mirroraliov.bilivideo.com",
       store: { [K_RANK]: JSON.stringify({ at: clock.now, via: "sample", ranking: [ALIOV], samples: [] }) }
     });
     checkTrue("a binary body comes back rewritten", hasBytes(run.donePayload.body, urlOf(ALIOV)));
