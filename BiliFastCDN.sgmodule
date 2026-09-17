@@ -1,0 +1,22 @@
+#!name=BiliFastCDN · B站CDN加速
+#!desc=劫持 B 站 playurl / 直播 playinfo 接口，把视频 CDN 域名重写为实测最快的节点。
+#!system=ios
+#!arguments=enabled:true,mode:smart,backupFanout:true,liveFilter:true,notify:true,debug:false
+#!arguments-desc=enabled:总开关。 mode:改写策略（smart 有测速结果时全量改写，无结果时只改写劣质节点；force 总是改写；bad-only 只改写 PCDN/劣质节点；off 关闭改写）。 backupFanout:是否把候选节点写入 backupUrl 供播放器自行容错。 liveFilter:是否从直播 url_info 中剔除 PCDN 节点。 notify:测速完成后是否发出通知。 debug:调试模式，把每一次判定写进 Surge 日志，并在每次改写时发一条通知（30 秒内不重复），用来确认到底有没有生效。
+#
+# 安装：本文件与 bili-cdn.js 放进 Surge 目录 → 模块里启用 → 打开 MitM 总开关并信任证书。
+# 没有 MitM 脚本不会执行，模块等同于没开。用法、参数、已知限制见仓库 README。
+# 是否生效看策略页的「B站CDN」面板卡片：命中 0 次 = 没收到流量，改写 >0 = 已生效。
+# 点卡片刷新按钮立即测速；debug 参数可把每次判定写进 Surge 日志。
+
+[Script]
+BiliFastCDN-Rewrite = type=http-response,pattern=^https?://(api\.bilibili\.com|app\.bilibili\.com|api\.live\.bilibili\.com|api\.biliapi\.net|api\.snm0516\.aisee\.tv)/.*(playurl|getRoomPlayInfo),requires-body=1,max-size=10485760,timeout=20,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-cdn.js,argument=enabled={{{enabled}}}&mode={{{mode}}}&backupFanout={{{backupFanout}}}&liveFilter={{{liveFilter}}}&notify={{{notify}}}&debug={{{debug}}}
+BiliFastCDN-Probe = type=cron,cronexp="*/30 * * * *",timeout=60,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-cdn.js,argument=enabled={{{enabled}}}&mode={{{mode}}}&notify={{{notify}}}&debug={{{debug}}}
+BiliFastCDN-Panel = type=generic,timeout=30,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-cdn.js,argument=enabled={{{enabled}}}&mode={{{mode}}}&notify={{{notify}}}&debug={{{debug}}}
+
+# 点刷新按钮 = 立即测速；自动刷新只读缓存，不发请求。
+[Panel]
+BiliFastCDN = title="B站CDN",content="点刷新按钮测速",style=info,script-name=BiliFastCDN-Panel,update-interval=1
+
+[MITM]
+hostname = %APPEND% api.bilibili.com, app.bilibili.com, api.live.bilibili.com, api.biliapi.net, api.snm0516.aisee.tv

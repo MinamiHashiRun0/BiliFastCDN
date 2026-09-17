@@ -45,14 +45,27 @@ Surge MitM（只覆盖 API 域名）
 
 ## 安装（iOS）
 
-1. 把 `BiliFastCDN.sgmodule` 和 `bili-cdn.js` 放进 Surge 的目录
-   （用 Files App 进入「我的 iPhone → Surge」放入）。
-   > 也可以远端分发：把 `bili-cdn.js` 上传后，把模块里三处 `script-path` 换成完整 URL。
+### 方式一：从 URL 安装（推荐）
+
+1. Surge → 首页 → 模块 → 从 URL 安装，填入：
+
+   ```
+   https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/BiliFastCDN.sgmodule
+   ```
+
+2. 打开 **MitM** 总开关，并安装 / 信任证书。没有 MitM，脚本不会执行，模块等同于没开。
+3. 打开策略选择页，应该能看到「B站CDN」面板卡片。
+
+> 模块里三处 `script-path` 指向 `raw/main/bili-cdn.js`，所以更新脚本只需 push，用户不用重装模块。
+> 代价是模块内容与脚本版本不一一对应 —— 要固定版本就把这三处换成 `raw/v0.1.0/bili-cdn.js`。
+> 注意 `raw.githubusercontent.com` 在国内通常不通，墙内使用请自行换镜像（模块会静默失效：面板一直「命中 0 次」）。
+
+### 方式二：本地安装
+
+1. 把 `BiliFastCDN.sgmodule` 和 `bili-cdn.js` 放进 Surge 的目录（Files App →「我的 iPhone → Surge」），
+   并把模块里三处 `script-path` 改回本地文件名 `bili-cdn.js`。
 2. 在 Surge 的「模块」里安装并启用 `BiliFastCDN`。
-   文件放对目录后应出现在本地模块列表中；若列表里没有，改用「从 URL 安装」并指向你托管的那两个文件。
-3. Surge → 首页 → 打开 **MitM** 总开关，并安装 / 信任证书。
-   没有 MitM，脚本不会执行，本模块等同于没开。
-4. 打开策略选择页，应该能看到「B站CDN」面板卡片。
+3. 同上第 2、3 步。
 
 ## 配置项
 
