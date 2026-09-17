@@ -757,6 +757,10 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
       ldf(2, [].concat(sfield(1, urlOf(host)), sfield(3, "backup"))),
       sfield(4, "tail")
     ));
+    // gRPC framing: 1 byte compression flag + 4 byte big-endian length + message.
+    const be32 = (n) => [Math.floor(n / 16777216) % 256, Math.floor(n / 65536) % 256, Math.floor(n / 256) % 256, n % 256];
+    const frame = (msg, flag) => [].concat([flag || 0], be32(msg.length), msg);
+    const framed = (host) => new Uint8Array(frame(Array.from(mkBody(host))));
     const fresh = () => ({ count: 0, reasons: {}, details: [], grpcRewrites: 0 });
     const cfg = Object.assign({}, api.DEFAULTS, { mode: "smart" });
     const ranked = { ranking: [ALIOV] };
@@ -805,11 +809,49 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     api.rewriteProto(multi, cfg, ranked, mst);
     check("every occurrence in the message is swapped", mst.grpcRewrites, 2);
 
+    // The real body is a stream of gRPC frames, not a bare message. Treating it as
+    // a bare message makes the parser reject byte 0 (the flag) and rewrite nothing —
+    // which is exactly what an on-device run showed (13 calls, 0 rewrites).
+    const f1s = fresh();
+    const f1 = api.rewriteGrpcBody(framed(COSOV), cfg, ranked, f1s);
+    check("a gRPC frame is rewritten", f1s.grpcRewrites, 1);
+    check("the frame stream is reported", [f1.frames, f1.compressed, f1.framed], [1, 0, true]);
+    check("an equal-length swap keeps the frame size", f1.out.length, framed(COSOV).length);
+    check("the framed message parses back",
+      stringsOf(f1.out.slice(5)), ["playurl-id", urlOf(ALIOV), "backup", "tail"]);
+
+    const f2s = fresh();
+    const f2 = api.rewriteGrpcBody(framed(AKAM), cfg, ranked, f2s);
+    check("a resized frame grows by the host delta",
+      f2.out.length - framed(AKAM).length, ALIOV.length - AKAM.length);
+    check("the resized frame still parses back",
+      stringsOf(f2.out.slice(5)), ["playurl-id", urlOf(ALIOV), "backup", "tail"]);
+
+    const two = new Uint8Array([].concat(
+      frame(Array.from(mkBody(COSOV))), frame(Array.from(mkBody(COSOV)))));
+    const f3s = fresh();
+    const f3 = api.rewriteGrpcBody(two, cfg, ranked, f3s);
+    check("every frame is scanned", f3.frames, 2);
+    check("every frame is rewritten", f3s.grpcRewrites, 2);
+
+    // A compressed frame cannot be recompressed here, so it must be left intact and
+    // reported — silently dropping it would look identical to "nothing matched".
+    const gzFrame = new Uint8Array(frame([31, 139, 8, 0, 1, 2, 3], 1));
+    const f4 = api.rewriteGrpcBody(gzFrame, cfg, ranked, fresh());
+    check("a compressed frame is left as is", f4.out, null);
+    check("the compressed frame is counted", f4.compressed, 1);
+
+    check("a truncated frame stream is not touched",
+      api.rewriteGrpcBody(new Uint8Array([].concat(frame(Array.from(mkBody(COSOV))), [0, 0, 0])),
+        cfg, ranked, fresh()).out, null);
+    check("a bare message is not mistaken for a frame stream",
+      api.rewriteGrpcBody(mkBody(COSOV), cfg, ranked, fresh()).framed, false);
+
     // End to end: a binary body must take the gRPC path and come back as bytes.
     const run = await runSurge({
       script: { type: "http-response" },
       request: { url: "https://grpc.biliapi.net/bilibili.app.playerunite.v1.Player/PlayViewUnite" },
-      response: { status: 200, headers: {}, body: mkBody(COSOV) },
+      response: { status: 200, headers: {}, body: framed(COSOV) },
       argument: "mode=smart",
       store: { [K_RANK]: JSON.stringify({ at: clock.now, via: "sample", ranking: [ALIOV], samples: [] }) }
     });
@@ -821,25 +863,27 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     const runOff = await runSurge({
       script: { type: "http-response" },
       request: { url: "https://grpc.biliapi.net/bilibili.app.playurl.v1.PlayURL/PlayConf" },
-      response: { status: 200, headers: {}, body: mkBody(COSOV) },
+      response: { status: 200, headers: {}, body: framed(COSOV) },
       argument: "mode=smart&grpcRewrite=false",
       store: { [K_RANK]: JSON.stringify({ at: clock.now, via: "sample", ranking: [ALIOV], samples: [] }) }
     });
     check("grpcRewrite=false leaves the body alone", runOff.donePayload, {});
     check("but the gRPC call is still counted", JSON.parse(runOff.store[K_STATS]).grpcCalls, 1);
 
-    // A gzipped message cannot be recompressed here, so it must be skipped loudly.
-    const gz = new Uint8Array([].concat([31, 139, 8, 0], asc(urlOf(COSOV))));
+    // A compressed frame cannot be recompressed, so it must pass through and the
+    // debug line has to say so — otherwise it looks identical to "no host matched".
     const runGz = await runSurge({
       script: { type: "http-response" },
       request: { url: "https://grpc.biliapi.net/bilibili.app.playerunite.v1.Player/PlayViewUnite" },
-      response: { status: 200, headers: {}, body: gz },
+      response: { status: 200, headers: {}, body: new Uint8Array(frame([31, 139, 8, 0, 1, 2, 3], 1)) },
       argument: "mode=smart&debug=true",
       store: { [K_RANK]: JSON.stringify({ at: clock.now, via: "sample", ranking: [ALIOV], samples: [] }) }
     });
-    check("a gzipped gRPC body passes through", runGz.donePayload, {});
-    checkTrue("and the skip is logged",
-      runGz.logs.some((l) => l.indexOf("gzip-skip") !== -1));
+    check("a compressed gRPC body passes through", runGz.donePayload, {});
+    checkTrue("and the compressed frame is logged",
+      runGz.logs.some((l) => l.indexOf("compressed=1") !== -1));
+    checkTrue("the debug line reports the frame count",
+      runGz.logs.some((l) => l.indexOf("frames=1") !== -1));
   }
 
   // ---- 11. panel role -----------------------------------------------------
