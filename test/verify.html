@@ -14,36 +14,21 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
 </script>
 <script>
 /*
- * Offline verification for ../bili-cdn.js.
+ * Offline verification for ../bili-cdn.js + ../BiliFastCDN.sgmodule.
  *
- * Runs the script the way Surge would — inside a fake environment that provides
- * $script / $request / $response / $httpClient / $persistentStore / $done — and
- * checks each rewrite decision against the reference implementation it was
- * ported from (bilibili-accelerator.user.js).
+ * The backend is a port of Biliverse/Redirect's Surge implementation
+ * (src/process/Request.mjs + template/surge.handlebars, Apache-2.0). Every case
+ * below is written with the upstream branch it mirrors named in the check, so a
+ * regression shows which rule drifted.
  *
- * Chrome refuses to read a file:// page's siblings without an explicit flag, so:
+ * Chrome refuses to read a file:// page's siblings without an explicit flag:
  *
  *   chrome --headless=new --disable-gpu --allow-file-access-from-files \
- *          --virtual-time-budget=10000 --dump-dom test/verify.html
- *
- * Set the REF constant below to the userscript if it lives elsewhere; when it
- * cannot be read the oracle section is skipped and reported as such.
+ *          --virtual-time-budget=20000 --dump-dom test/verify.html
  */
 
 (async function () {
   "use strict";
-
-  // Where to look for the reference userscript. Drop a copy of
-  // bilibili-accelerator.user.js into test/fixtures/ to make the comparison work
-  // wherever this repo lives; the absolute path is just this machine's copy.
-  const REF_CANDIDATES = [
-    "./fixtures/bilibili-accelerator.user.js",
-    "file:///E:/Downloads/bilibili-accelerator.user.js"
-  ];
-  const K_SAMPLE = "bili_fast_cdn.sample.v1";
-  const K_RANK = "bili_fast_cdn.rank.v1";
-  const K_STATS = "bili_fast_cdn.stats.v1";
-  const TARGET = "upos-tf-all-hw.bilivideo.com";
 
   const lines = [];
   let pass = 0;
@@ -58,7 +43,6 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
   function checkTrue(name, actual) { check(name, !!actual, true); }
   function note(text) { lines.push("   " + text); }
 
-  // Rendered after every section, so a crash mid-suite still shows how far it got.
   function render(final) {
     const total = pass + failures.length;
     const head = final
@@ -74,11 +58,6 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     render(false);
   }
 
-  // ---- a deterministic clock ----------------------------------------------
-  // Surge measures a probe as (bytes, elapsed). Chrome's --virtual-time-budget
-  // fires timers early and would collapse every elapsed time to zero, so the
-  // clock is driven by the stub instead: a request that "takes 400ms" advances
-  // Date.now() by exactly 400ms.
   const clock = { now: 1700000000000 };
   Date.now = () => clock.now;
 
@@ -89,1288 +68,320 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
   }
 
   const SOURCE = await readText("../bili-cdn.js");
+  const MODULE = await readText("../BiliFastCDN.sgmodule");
 
-  // The script's export block keys off `module`, which is how the suite reaches
-  // its internals without a bundler.
   window.module = { exports: {} };
   window.eval(SOURCE);
   const api = window.module.exports;
 
+  const K_STATS = "bili_fast_cdn.redirect.v1";
+  const DEFAULT_HOST = "upos-sz-mirrorali.bilivideo.com";
+
+  // Runs the script the way Surge would. $httpClient throws on purpose: this
+  // backend never makes a request of its own (no probing, no speed test).
   function runSurge(globals) {
     return new Promise((resolve, reject) => {
       const store = Object.assign({}, globals.store || {});
-      const run = {
-        store, logs: [], notifications: [], httpCalls: [],
-        donePayload: null, doneCount: 0
-      };
+      const run = { store, logs: [], donePayload: null, doneCount: 0 };
 
       window.$persistentStore = {
         read: (k) => (Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null),
         write: (v, k) => { store[k] = String(v); return true; }
       };
-      window.$notification = { post: (...args) => run.notifications.push(args) };
-      window.$httpClient = {
-        get: (opts, cb) => {
-          const spec = globals.http ? globals.http(opts) : { status: 200, data: "" };
-          run.httpCalls.push(opts);
-          const issuedAt = clock.now;
-          const delay = spec.delay || 0;
-          // Probes run in parallel, so each one finishes at issuedAt + its own
-          // latency. Advancing a shared clock instead would make every probe's
-          // measured time the running sum of the other probes' latencies.
-          setTimeout(() => {
-            clock.now = issuedAt + delay;
-            if (spec.error) cb(new Error("stub error"), null, null);
-            else cb(null, { status: spec.status, headers: spec.headers || {} }, spec.data);
-          }, delay);
-        }
-      };
+      window.$httpClient = { get: () => { throw new Error("this backend must never issue requests"); } };
+      window.$notification = { post: () => { throw new Error("this backend must never notify"); } };
       window.$done = (payload) => {
         run.doneCount += 1;
         run.donePayload = payload === undefined ? null : payload;
         resolve(run);
       };
       window.$argument = globals.argument;
-      window.$script = globals.script;
       window.console.log = (m) => run.logs.push(String(m));
 
-      if (globals.response) window.$response = globals.response; else delete window.$response;
       if (globals.request) window.$request = globals.request; else delete window.$request;
       if (globals.input) window.$input = globals.input; else delete window.$input;
-      if (globals.trigger) window.$trigger = globals.trigger; else delete window.$trigger;
-      if (globals.utils) window.$utils = globals.utils; else delete window.$utils;
 
       try {
         window.eval(SOURCE);
-      } catch (e) {
-        reject(e);
-        return;
-      }
+      } catch (e) { reject(e); return; }
       setTimeout(() => resolve(run), 2000);
     });
   }
 
-  const hostOf = (url) => { const p = api.parseUrl(url); return p ? p.host : null; };
-  const tailOf = (url) => { const p = api.parseUrl(url); return p ? p.tail : null; };
-  // Mirrors the script's own host shortening, for asserting on panel text.
-  const shorten = (host) => String(host).replace(/\.bilivideo\.com$/, "").replace(/^upos-/, "");
+  const asRequest = (url, argument, store) => runSurge({
+    request: { url, method: "GET" }, argument, store: store || {}
+  });
 
-  // ---- 1. url primitives --------------------------------------------------
+  function hostOf(url) { const p = api.parseUrl(url); return p ? p.host : null; }
+  function portOf(url) { const p = api.parseUrl(url); return p ? p.port : null; }
+  function pathOf(url) { const p = api.parseUrl(url); return p ? p.path + p.query : null; }
+
+  // ---- 1. url primitives -------------------------------------------------
 
   section("url primitives");
   {
-    const q = "?deadline=1700000000&oi=123&uipk=5&os=cos&sign=abc%2Fdef&nbs=1";
-    const media = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3-1-30080.m4s" + q;
-    const p = api.parseUrl(media);
-
-    check("parseUrl host", p.host, "upos-sz-mirrorcos.bilivideo.com");
-    check("parseUrl path", p.path, "/upgcxcode/1/2/3-1-30080.m4s");
-    check("parseUrl keeps an empty port for a default port", p.port, "");
-    checkTrue("isMediaPath recognises a segment", api.isMediaPath(p));
-    checkTrue("hasMediaSignal sees the host", api.hasMediaSignal(media));
-
-    // The query is the signature. It has to survive byte-for-byte.
-    check("swapHost preserves the query verbatim", tailOf(api.swapHost(media, TARGET)), tailOf(media));
-    check("swapHost rewrites the host", hostOf(api.swapHost(media, TARGET)), TARGET);
-    check("swapHost forces https", api.swapHost(media, TARGET).slice(0, 8), "https://");
-    check("swapHost handles protocol-relative urls",
-      api.swapHost("//upos-sz-mirrorcos.bilivideo.com/upgcxcode/1.m4s?a=1", TARGET),
-      "https://" + TARGET + "/upgcxcode/1.m4s?a=1");
-    check("swapHost drops a non-default port",
-      api.swapHost("https://xy1x2x3x4xy.mcdn.bilivideo.cn:486/v1/resource/3.m4s?os=mcdn", TARGET),
-      "https://" + TARGET + "/v1/resource/3.m4s?os=mcdn");
-    check("swapHost handles a url with no path",
-      api.swapHost("https://upos-sz-mirrorcos.bilivideo.com", TARGET), "https://" + TARGET);
-    check("swapHost rejects a non-string", api.swapHost(null, TARGET), null);
-    const odd = "https://upos-sz-mirrorcos.bilivideo.com/1.m4s?a=%20%2B&b=x";
-    check("swapHost leaves an odd query alone", tailOf(api.swapHost(odd, TARGET)), tailOf(odd));
-    check("cleanHost strips scheme and path",
-      api.cleanHost("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/x.m4s"), "upos-sz-mirrorcos.bilivideo.com");
-    check("cleanHost lowercases", api.cleanHost("UPOS-SZ-MirrorCOS.bilivideo.com"), "upos-sz-mirrorcos.bilivideo.com");
-    check("parseUrl rejects a non-url", api.parseUrl("not-a-url"), null);
-    check("pool size", api.CANDIDATE_POOL.length, 8);
+    const p = api.parseUrl("http://a.b.c:4483/upgcxcode/1.m4s?os=mcdn&x=1");
+    check("parseUrl scheme", p.scheme, "http");
+    check("parseUrl host", p.host, "a.b.c");
+    check("parseUrl port", p.port, "4483");
+    check("parseUrl path", p.path, "/upgcxcode/1.m4s");
+    check("parseUrl query", p.query, "?os=mcdn&x=1");
+    check("parseUrl on garbage", api.parseUrl("not a url"), null);
+    check("buildUrl without port", api.buildUrl("https", "h", "", "/p", "?q=1"), "https://h/p?q=1");
+    check("buildUrl with port", api.buildUrl("http", "h", "486", "/p", ""), "http://h:486/p");
+    check("queryParam decodes", api.queryParam("?a=1&xy_usource=upos-sz-mirrorhw.bilivideo.com", "xy_usource"),
+      "upos-sz-mirrorhw.bilivideo.com");
+    check("queryParam decodes percent-encoded values", api.queryParam("?url=a%2Fb%3Fc%3D1", "url"), "a/b?c=1");
+    check("queryParam missing", api.queryParam("?a=1", "b"), null);
   }
 
-  // ---- 2. configuration ---------------------------------------------------
+  // ---- 2. configuration --------------------------------------------------
 
   section("configuration");
   {
-    check("query-string argument", api.parseArgument("enabled=false&mode=force&notify=no"),
-      { enabled: "false", mode: "force", notify: "no" });
-    check("json argument", api.parseArgument('{"mode":"bad-only"}'), { mode: "bad-only" });
-    check("empty argument", api.parseArgument(""), {});
-    check("missing argument", api.parseArgument(undefined), {});
-    // Surge older than 5.10 ignores #!arguments and leaves the braces in place.
-    check("unresolved placeholder is ignored", api.parseArgument("mode={{{mode}}}&enabled=true"), { enabled: "true" });
-    check("url-encoded value", api.parseArgument("mode=smart&x=a%20b"), { mode: "smart", x: "a b" });
-
     const cfg = api.loadConfig();
-    check("default mode", cfg.mode, "smart");
-    // 两个上游项目都默认把 MCDN 走代理包裹，本模块跟随
-    check("default mcdn strategy is the proxy wrap", cfg.mcdnStrategy, "proxy");
-    check("the default mcdn target is the proxy host", cfg.hostMcdn, "proxy-tf-all-ws.bilivideo.com");
-    check("category targets default to auto", [cfg.hostPcdn, cfg.hostOversea, cfg.hostBStar],
-      ["auto", "auto", "auto"]);
-    check("default notify", cfg.notify, true);
-    check("default rank ttl", cfg.rankTtlMs, 6 * 60 * 60 * 1000);
-    check("unknown mode falls back", api.loadConfig().mode, "smart");
+    check("Redirect's default targets", [cfg.hostOverseaVideo, cfg.hostBStar, cfg.hostPcdn],
+      [DEFAULT_HOST, DEFAULT_HOST, DEFAULT_HOST]);
+    check("Redirect's MCDN default", cfg.hostMcdn, "proxy-tf-all-ws.bilivideo.com");
+    check("debug defaults off", cfg.debug, false);
+
+    const over = await runSurge({ request: { url: "http://127.0.0.1:4480/x" },
+      argument: "hostOverseaVideo=upos-sz-mirrorhw.bilivideo.com&hostPcdn=upos-sz-mirrorcos.bilivideo.com&debug=true" });
+    check("an argument override reaches the panel", over.doneCount, 1);
+
+    window.$argument = "hostPcdn=https://upos-sz-mirrorcos.bilivideo.com:443/upgcxcode/";
+    const sanitised = api.loadConfig();
+    check("a pasted url is reduced to the host", sanitised.hostPcdn, "upos-sz-mirrorcos.bilivideo.com");
+
+    window.$argument = "host_oversea_video=upos-sz-mirrorhw.bilivideo.com";
+    check("snake_case aliases work", api.loadConfig().hostOverseaVideo, "upos-sz-mirrorhw.bilivideo.com");
+
+    window.$argument = "hostOverseaVideo={{{hostOverseaVideo}}}";
+    check("an unsubstituted placeholder falls back to the default",
+      api.loadConfig().hostOverseaVideo, DEFAULT_HOST);
+
+    window.$argument = "debug=on";
+    check("debug accepts on", api.loadConfig().debug, true);
+    window.$argument = "debug=false";
+    check("debug accepts false", api.loadConfig().debug, false);
+    window.$argument = "";
   }
 
-  // ---- 3. classification against the reference ----------------------------
+  // ---- 3. hostname categories (Redirect's switch) ------------------------
 
-  const CORPUS = [
-    "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&oi=2&os=cos&sign=abc",
-    "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&os=cosov&sign=abc",
-    "https://upos-sz-mirroraliov.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&sign=abc",
-    "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/1/2/3.m4s?deadline=1&sign=abc",
-    "https://upos-sz-mirrorcos.bilivideo.com:4480/upgcxcode/1/2/3.m4s?deadline=1&sign=abc",
-    "https://123.45.67.89/upgcxcode/1/2/3.m4s?deadline=1&sign=abc",
-    "https://upos-sz-mirror14b.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&sign=abc",
-    "https://upos-sz-302ppio.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&sign=abc",
-    "https://edge.node.mountaintoys.cn/upgcxcode/1/2/3.m4s?deadline=1&sign=abc",
-    "https://xy1x2x3x4xy.mcdn.bilivideo.cn:486/v1/resource/3.m4s?os=mcdn&deadline=1&sign=abc",
-    "https://xy1x2x3x4xy.mcdn.bilivideo.com/v1/resource/3.m4s?deadline=1&sign=abc",
-    "https://foo.szbdyd.com/upgcxcode/1/2/3.m4s?xy_usource=upos-sz-mirrorhw.bilivideo.com&deadline=1&sign=abc",
-    "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?os=mcdn&deadline=1&sign=abc",
-    "https://upos-sz-mirrorhw.bilivideo.com/9/8/7.flv?deadline=1&sign=abc",
-    "https://upos-sz-mirrorali.bilivideo.com/1/2/3.mp4?deadline=1&sign=abc",
-    "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s",
-    "https://upos-sz-mirrorcos.bilivideo.com/index.html",
-    "https://api.bilibili.com/x/player/playurl?bvid=BV1&cid=1"
-  ];
-
-  // 与参考实现**有意不同**的一处：上游把裸 IP 当 PCDN，那在浏览器里没问题（播放器有
-  // backup_url 与卡顿恢复兜底）；我们一旦判成劣质，换掉的是播放器正在用的那条 URL，
-  // 实测把 App 下发的 IP 形式 CDN 地址换成主机名后 403，整集放不出来 —— 所以裸 IP 不算劣质。
-  const REF_DEVIATIONS = [
-    "https://123.45.67.89/upgcxcode/1/2/3.m4s?deadline=1&sign=abc"
-  ];
-
-  section("classification vs the reference userscript");
+  section("hostname categories");
   {
-    let ref = null;
-    for (const candidate of REF_CANDIDATES) {
-      try {
-        const refSrc = await readText(candidate);
-        // The second half of that file is page UI and would install itself into
-        // this page; the core it exports is all the comparison needs.
-        const cut = refSrc.indexOf("(function installBiliAccelerator");
-        window.eval(cut > 0 ? refSrc.slice(0, cut) : refSrc);
-        ref = window.BiliAcceleratorCore;
-        note("compared against " + candidate);
-        break;
-      } catch (e) {
-        // try the next location
-      }
-    }
-    if (!ref) {
-      note("reference userscript not readable — oracle comparison SKIPPED");
-      note("put it at test/fixtures/bilibili-accelerator.user.js to enable it");
-    }
+    const cfg = api.loadConfig();
+    const cases = [
+      // their fixed lists
+      ["upos-hz-mirrorakam.akamaized.net", "hostOverseaVideo", "oversea-video"],
+      ["upos-sz-mirrorakam.akamaized.net", "hostOverseaVideo", "oversea-video"],
+      ["upos-sz-mirrorawsov.bilivideo.com", "hostOverseaVideo", "oversea-video"],
+      ["upos-sz-mirroraliov.bilivideo.com", "hostOverseaVideo", "oversea-video"],
+      ["upos-sz-mirrorcosov.bilivideo.com", "hostOverseaVideo", "oversea-video"],
+      ["upos-sz-mirrorhwov.bilivideo.com", "hostOverseaVideo", "oversea-video"],
+      ["upos-sz-mirroralibstar1.bilivideo.com", "hostBStar", "bstar"],
+      ["upos-sz-mirrorcosbstar1.bilivideo.com", "hostBStar", "bstar"],
+      ["upos-sz-mirrorhwbstar1.bilivideo.com", "hostBStar", "bstar"],
+      ["upos-bstar1-mirrorakam.akamaized.net", "hostBStar", "bstar"],
+      // wildcard fallbacks
+      ["upos-sz-mirrorxxxxov.bilivideo.com", "hostOverseaVideo", "oversea-video"],
+      ["cn-hk-eq-01-01.bilivideo.com", "hostOverseaVideo", "oversea-video"],
+      ["upos-sz-mirrorweirdbstar1.bilivideo.com", "hostBStar", "bstar"]
+    ];
+    cases.forEach((c) => {
+      const r = api.classifyHost(cfg, c[0]);
+      check("category " + c[0], r && [r.host, r.reason], [cfg[c[1]], c[2]]);
+    });
 
-    if (ref) {
-      const refCfg = {
-        enabled: true, mode: "force", selection: "fixed", pcdnHost: TARGET,
-        mcdnStrategy: "proxy-all", rewriteAkamai: false, portHeuristic: true, schemaVersion: 3
-      };
-      const myCfg = Object.assign({}, api.DEFAULTS, { mode: "force", mcdnStrategy: "proxy" });
-      const rank = { ranking: [TARGET] };
-
-      for (const url of CORPUS) {
-        if (REF_DEVIATIONS.indexOf(url) !== -1) continue;
-        const r = ref.classify(new URL(url), refCfg);
-        const m = api.classify(api.parseUrl(url), myCfg);
-        check("classify pcdn   " + url, m.pcdn, r.isPcdn);
-        check("classify mcdn   " + url, m.mcdn, r.isMcdn);
-        check("classify akamai " + url, m.akamai, r.isAkamai);
-
-        const refOut = ref.rewriteUrlDetail(url, refCfg);
-        const myOut = api.rewriteOne(url, myCfg, rank);
-        check("rewrite host   " + url,
-          myOut ? hostOf(myOut.url) : hostOf(url),
-          refOut.changed ? hostOf(refOut.url) : hostOf(url));
-        if (refOut.changed && myOut) {
-          check("rewrite tail   " + url, tailOf(myOut.url), tailOf(refOut.url));
-        }
-      }
-      // 偏离项单独断言，避免它悄悄从对照里消失。
-      for (const url of REF_DEVIATIONS) {
-        const r = ref.classify(new URL(url), refCfg);
-        const m = api.classify(api.parseUrl(url), myCfg);
-        check("deviation: the reference treats a bare ip as pcdn   " + url, r.isPcdn, true);
-        check("deviation: we do not   " + url, m.pcdn, false);
-      }
-      note((CORPUS.length - REF_DEVIATIONS.length) + " urls compared against the reference, " +
-        REF_DEVIATIONS.length + " intentional deviation");
-    }
+    // mainland mirrors are the targets themselves: never moved
+    api.MAINLAND_MIRRORS.forEach((h) => {
+      checkTrue("mainland mirror " + h + " is left alone", api.classifyHost(cfg, h) === null);
+    });
   }
 
-  // ---- 4. live payloads ---------------------------------------------------
+  // ---- 4. MCDN / PCDN port matrix ----------------------------------------
 
-  section("live playinfo filtering");
+  section("MCDN / PCDN");
   {
-    const cfg = Object.assign({}, api.DEFAULTS);
-
-    checkTrue("a pcdn live host is slow", api.isSlowLiveHost("https://xy1x2x3x4xy.mcdn.bilivideo.cn:486", "", cfg));
-    checkTrue("a ported live host is slow", api.isSlowLiveHost("https://upos-sz-mirrorcos.bilivideo.com:4480", "", cfg));
-    checkTrue("an os=mcdn live host is slow", api.isSlowLiveHost("https://foo.bilivideo.com", "os=mcdn&x=1", cfg));
-    check("a normal live host is fine", api.isSlowLiveHost("https://upos-sz-mirrorcos.bilivideo.com", "", cfg), false);
-
-    const payload = {
-      code: 0,
-      data: {
-        playurl_info: {
-          playurl: {
-            stream: [{
-              format: [{
-                codec: [{
-                  url_info: [
-                    { host: "https://xy1x2x3x4xy.mcdn.bilivideo.cn:486", extra: "?os=mcdn" },
-                    { host: "https://upos-sz-mirrorcos.bilivideo.com", extra: "" }
-                  ]
-                }]
-              }]
-            }]
-          }
-        }
-      }
+    const cfg = api.loadConfig();
+    const expect = (name, url, expected) => {
+      const hit = api.rewriteRequest(url, cfg);
+      check(name, hit ? hit.url : null, expected);
     };
-    check("one url_info entry dropped", api.filterLiveUrlInfo(payload, cfg, 0, new Set()), 1);
-    const kept = payload.data.playurl_info.playurl.stream[0].format[0].codec[0].url_info;
-    check("only the official host survives", kept.length, 1);
-    check("surviving host", kept[0].host, "https://upos-sz-mirrorcos.bilivideo.com");
 
-    // Dropping the last usable host would hard-break live playback.
-    const allBad = {
-      url_info: [
-        { host: "https://xy1x2x3x4xy.mcdn.bilivideo.cn:486", extra: "?os=mcdn" },
-        { host: "https://xy5x6x7x8xy.mcdn.bilivideo.cn:486", extra: "?os=mcdn" }
-      ]
-    };
-    check("an all-pcdn list is left alone", api.filterLiveUrlInfo(allBad, cfg, 0, new Set()), 0);
-    check("an all-pcdn list keeps both", allBad.url_info.length, 2);
+    // .mcdn.bilivideo.cn with no port: retarget the port by path + protocol
+    expect("mcdn http /v1/resource/ -> :8000",
+      "http://xy1x2x3x4xy.mcdn.bilivideo.cn/v1/resource/3.m4s?a=1",
+      "http://xy1x2x3x4xy.mcdn.bilivideo.cn:8000/v1/resource/3.m4s?a=1");
+    expect("mcdn https /v1/resource/ -> :8082",
+      "https://xy1x2x3x4xy.mcdn.bilivideo.cn/v1/resource/3.m4s",
+      "https://xy1x2x3x4xy.mcdn.bilivideo.cn:8082/v1/resource/3.m4s");
+    expect("mcdn http /upgcxcode/ -> :9102",
+      "http://xy1x2x3x4xy.mcdn.bilivideo.cn/upgcxcode/3.m4s",
+      "http://xy1x2x3x4xy.mcdn.bilivideo.cn:9102/upgcxcode/3.m4s");
+    expect("mcdn https /upgcxcode/ -> :4483",
+      "https://xy1x2x3x4xy.mcdn.bilivideo.cn/upgcxcode/3.m4s",
+      "https://xy1x2x3x4xy.mcdn.bilivideo.cn:4483/upgcxcode/3.m4s");
+    expect("mcdn with an unrelated path is left alone",
+      "http://xy1x2x3x4xy.mcdn.bilivideo.cn/other/x", null);
+
+    // :486 — cdn / sid
+    expect("mcdn :486 with cdn",
+      "http://x.mcdn.bilivideo.cn:486/upgcxcode/3.m4s?cdn=abc&x=1",
+      "http://d1--abc.bilivideo.com/upgcxcode/3.m4s?cdn=abc&x=1");
+    expect("mcdn :486 with sid",
+      "http://x.mcdn.bilivideo.cn:486/upgcxcode/3.m4s?sid=xyz",
+      "http://xyz.bilivideo.com/upgcxcode/3.m4s?sid=xyz");
+    expect("mcdn :486 without cdn/sid is left alone",
+      "http://x.mcdn.bilivideo.cn:486/upgcxcode/3.m4s", null);
+
+    // :4483 / :9102 — proxy wrap
+    expect("mcdn :4483 is wrapped by the proxy host",
+      "http://x.mcdn.bilivideo.cn:4483/upgcxcode/3.m4s?trid=1",
+      "http://proxy-tf-all-ws.bilivideo.com/?url=" +
+      encodeURIComponent("http://x.mcdn.bilivideo.cn:4483/upgcxcode/3.m4s?trid=1"));
+    expect("mcdn :9102 is wrapped too",
+      "http://x.mcdn.bilivideo.cn:9102/upgcxcode/3.m4s",
+      "http://proxy-tf-all-ws.bilivideo.com/?url=" +
+      encodeURIComponent("http://x.mcdn.bilivideo.cn:9102/upgcxcode/3.m4s"));
+    expect("a .bilivideo.com host on :4483 is skipped",
+      "http://x.bilivideo.com:4483/upgcxcode/3.m4s", null);
+    expect("an already wrapped url is skipped (no loop)",
+      "http://x.mcdn.bilivideo.cn:4483/upgcxcode/3.m4s?originalUrl=http%3A%2F%2Fa.b%2Fc", null);
+    expect("the resource form is left alone",
+      "http://x.mcdn.bilivideo.cn:8000/v1/resource/3.m4s", null);
+
+    // PCDN
+    expect("pcdn :4480 returns to xy_usource",
+      "https://1.2.3.4:4480/upgcxcode/3.m4s?xy_usource=upos-sz-mirrorhw.bilivideo.com&bw=1",
+      "http://upos-sz-mirrorhw.bilivideo.com/upgcxcode/3.m4s?xy_usource=upos-sz-mirrorhw.bilivideo.com&bw=1");
+    expect("pcdn :4480 without xy_usource falls back to the configured host",
+      "https://1.2.3.4:4480/upgcxcode/3.m4s",
+      "http://upos-sz-mirrorali.bilivideo.com/upgcxcode/3.m4s");
+    expect("pcdn :9305 takes the host from the first path segment",
+      "http://1.2.3.4:9305/upos-sz-mirrorcos.bilivideo.com/upgcxcode/3.m4s?x=1",
+      "http://upos-sz-mirrorcos.bilivideo.com/upgcxcode/3.m4s?x=1");
+
+    // host rules win over the port rules
+    expect("an *ov host on a port still goes to the oversea target",
+      "http://upos-sz-mirroraliov.bilivideo.com:4483/upgcxcode/3.m4s",
+      "http://upos-sz-mirrorali.bilivideo.com/upgcxcode/3.m4s");
+    // 大陆镜像就是"目标本身"：上游在 switch 里把它们 break 掉，端口分支也不会碰到它们。
+    expect("a mainland mirror on a port is left alone",
+      "http://upos-sz-mirrorali.bilivideo.com:80/upgcxcode/3.m4s", null);
   }
 
-  // ---- 5. ranking ---------------------------------------------------------
+  // ---- 5. the request role ------------------------------------------------
 
-  section("ranking");
+  section("request role");
   {
-    const ranked = api.rankSamples([
-      { host: "a", ok: true, mbps: 12, ms: 100 },
-      { host: "b", ok: false, mbps: 0, ms: 20 },
-      { host: "c", ok: true, mbps: 40, ms: 300 },
-      { host: "d", ok: true, mbps: 12, ms: 50 }
-    ]);
-    // a and d tie on rate, so the lower latency (d) comes first — the same
-    // tie-break the reference's rankHosts applies.
-    check("throughput decides, latency breaks ties", ranked.map((r) => r.host), ["c", "d", "a"]);
+    const rewritten = await asRequest("http://upos-hz-mirrorakam.akamaized.net/upgcxcode/1/2/3.m4s?deadline=1&os=akam",
+      "hostOverseaVideo=upos-sz-mirrorhw.bilivideo.com");
+    check("akam is redirected to the configured oversea target",
+      rewritten.donePayload.url, "http://upos-sz-mirrorhw.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&os=akam");
+    check("the signed query is preserved", pathOf(rewritten.donePayload.url),
+      "/upgcxcode/1/2/3.m4s?deadline=1&os=akam");
 
-    const latencyOnly = api.rankSamples([
-      { host: "slow", ok: true, mbps: 0, ms: 400 },
-      { host: "fast", ok: true, mbps: 0, ms: 40 }
-    ]);
-    check("latency-only ranking", latencyOnly.map((r) => r.host), ["fast", "slow"]);
-    check("throughput math", Math.round(api.throughputMbps(1048576, 200) * 100) / 100, 41.94);
-    check("throughput of nothing", api.throughputMbps(0, 100), 0);
-  }
+    const untouched = await asRequest("http://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s", "");
+    check("a mainland mirror passes through", untouched.donePayload, {});
 
-  // ---- 6. sample discovery ------------------------------------------------
+    const stats = JSON.parse(rewritten.store[K_STATS]);
+    check("a rewrite is counted", [stats.calls, stats.rewrites], [1, 1]);
+    check("the reason is recorded", stats.last.reason, "oversea-video");
+    check("the move is recorded", [stats.last.from, stats.last.to],
+      ["upos-hz-mirrorakam.akamaized.net", "upos-sz-mirrorhw.bilivideo.com"]);
 
-  section("sample discovery");
-  {
-    const payload = {
-      data: {
-        dash: {
-          video: [{ baseUrl: "https://xy1x2x3x4xy.mcdn.bilivideo.cn:486/v1/resource/v.m4s?os=mcdn" }],
-          audio: [{ baseUrl: "https://upos-sz-mirrorhw.bilivideo.com/upgcxcode/1/2/a.m4s?deadline=1" }]
-        }
-      }
-    };
-    // Video is walked first. A pcdn url is still a fine probe sample: the
-    // signature does not cover the host, which is the premise of the whole module.
-    check("prefers a video segment", api.findSample(payload),
-      "https://xy1x2x3x4xy.mcdn.bilivideo.cn:486/v1/resource/v.m4s?os=mcdn");
-    check("no media url in an empty payload", api.findSample({ data: { dash: {} } }), null);
-  }
+    const quiet = await asRequest("http://upos-hz-mirrorakam.akamaized.net/upgcxcode/x", "");
+    check("passing through is counted too", JSON.parse(quiet.store[K_STATS]).calls, 1);
+    check("but no debug line without debug", quiet.logs.length, 0);
 
-  // ---- 7. response role, end to end ---------------------------------------
-
-  section("response role");
-  {
-    const V_URL = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3-1-30080.m4s?deadline=1&oi=2&os=cos&sign=abc";
-    const B_URL = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/1/2/3-1-30080.m4s?deadline=1&oi=2&os=ali&sign=abc";
-    const A_URL = "https://xy1x2x3x4xy.mcdn.bilivideo.cn:486/v1/resource/3-1-30280.m4s?os=mcdn&deadline=1&sign=abc";
-    const D_URL = "https://upos-sz-mirrorhw.bilivideo.com/upgcxcode/9/8/7.flv?deadline=1&sign=abc";
-    const body = JSON.stringify({
-      code: 0,
-      data: {
-        dash: {
-          duration: 100,
-          video: [{ id: 80, baseUrl: V_URL, backupUrl: [B_URL] }],
-          audio: [{ id: 30280, baseUrl: A_URL }]
-        },
-        durl: [{ url: D_URL }]
-      }
-    });
-    const storedRank = JSON.stringify({
-      at: clock.now, via: "sample", ranking: [TARGET, "upos-sz-mirrorcosov.bilivideo.com"], samples: []
-    });
-
-    const run = await runSurge({
-      script: { type: "http-response" },
-      request: { url: "https://api.bilibili.com/x/player/playurl?bvid=BV1&cid=1&fnval=16" },
-      response: {
-        status: 200,
-        headers: { "Content-Type": "application/json", "Content-Length": String(body.length) },
-        body
-      },
-      argument: "mode=force&notify=false",
-      store: { [K_RANK]: storedRank }
-    });
-
-    check("responded exactly once", run.doneCount, 1);
-    checkTrue("a body came back", run.donePayload && typeof run.donePayload.body === "string");
-
-    const out = JSON.parse(run.donePayload.body);
-    const video = out.data.dash.video[0];
-    const audio = out.data.dash.audio[0];
-    // Every rewritten url must still carry the exact tail Bilibili signed; the
-    // host is not part of the signature, the path and query are.
-    const SIGNED_TAILS = [tailOf(V_URL), tailOf(B_URL), tailOf(A_URL), tailOf(D_URL)];
-
-    check("primary moved to the fastest host", hostOf(video.baseUrl), TARGET);
-    check("the signed tail survived", tailOf(video.baseUrl), tailOf(V_URL));
-    check("mcdn audio went through the proxy wrap", hostOf(audio.baseUrl), "proxy-tf-all-ws.bilivideo.com");
-    check("the proxied audio carries the original url verbatim",
-      decodeURIComponent(tailOf(audio.baseUrl).replace("/?url=", "")), A_URL);
-    check("durl moved in force mode", hostOf(out.data.durl[0].url), TARGET);
-    check("the durl tail survived", tailOf(out.data.durl[0].url), tailOf(D_URL));
-    checkTrue("backups were fanned out", Array.isArray(video.backupUrl) && video.backupUrl.length > 1);
-    checkTrue("backups all point at pool hosts",
-      video.backupUrl.every((u) => api.CANDIDATE_POOL.indexOf(hostOf(u)) !== -1));
-    checkTrue("every backup carries a valid signature",
-      video.backupUrl.every((u) => SIGNED_TAILS.indexOf(tailOf(u)) !== -1));
-    // Force mode rewrites the backup entries too, so the original ali url is gone
-    // by host but its signature has to survive on the rewritten entry.
-    checkTrue("the original backup's signature is preserved",
-      video.backupUrl.some((u) => tailOf(u) === tailOf(B_URL)));
-    checkTrue("backups are capped", video.backupUrl.length <= 8);
-    checkTrue("the stale content-length was dropped", run.donePayload.headers["Content-Length"] === undefined);
-    checkTrue("content-type was kept", run.donePayload.headers["Content-Type"] === "application/json");
-    checkTrue("a sample was cached for probing", !!run.store[K_SAMPLE]);
-    check("the cached sample is the pre-rewrite url",
-      hostOf(JSON.parse(run.store[K_SAMPLE]).url), "upos-sz-mirrorcos.bilivideo.com");
-
-    // bad-only must leave a healthy CDN host as Bilibili chose it.
-    const soft = await runSurge({
-      script: { type: "http-response" },
-      request: { url: "https://api.bilibili.com/x/player/playurl?bvid=BV1&cid=1" },
-      response: { status: 200, headers: {}, body },
-      argument: "mode=bad-only",
-      store: { [K_RANK]: storedRank }
-    });
-    const softOut = JSON.parse(soft.donePayload.body);
-    check("bad-only leaves a healthy host alone",
-      hostOf(softOut.data.dash.video[0].baseUrl), "upos-sz-mirrorcos.bilivideo.com");
-    // MCDN 默认走代理包裹（两个上游项目都这么默认），所以目标是代理主机而不是测速最快
-    check("bad-only still moves the mcdn host, via the proxy by default",
-      hostOf(softOut.data.dash.audio[0].baseUrl), "proxy-tf-all-ws.bilivideo.com");
-
-    // smart is the default mode: once there is a measured ranking it must move even
-    // a healthy host, otherwise "redirect to the fastest CDN" never happens.
-    const smart = await runSurge({
-      script: { type: "http-response" },
-      request: { url: "https://api.bilibili.com/x/player/playurl?bvid=BV1&cid=1" },
-      response: { status: 200, headers: {}, body },
-      argument: "mode=smart&backup_fanout=false",
-      store: { [K_RANK]: storedRank }
-    });
-    const smartOut = JSON.parse(smart.donePayload.body);
-    check("smart rewrites a healthy host once ranked",
-      hostOf(smartOut.data.dash.video[0].baseUrl), TARGET);
-    check("smart rewrites the legacy durl too",
-      hostOf(smartOut.data.durl[0].url), TARGET);
-
-    // With no ranking there is nothing measured to move toward, so it stays
-    // conservative and only the pcdn host moves — to the fallback host.
-    const smartCold = await runSurge({
-      script: { type: "http-response" },
-      request: { url: "https://api.bilibili.com/x/player/playurl?bvid=BV1&cid=1" },
-      response: { status: 200, headers: {}, body },
-      argument: "mode=smart&backup_fanout=false"
-    });
-    const coldOut = JSON.parse(smartCold.donePayload.body);
-    check("smart leaves a healthy host alone before the first test",
-      hostOf(coldOut.data.dash.video[0].baseUrl), "upos-sz-mirrorcos.bilivideo.com");
-    check("the mcdn host is proxied before the first test",
-      hostOf(coldOut.data.dash.audio[0].baseUrl), "proxy-tf-all-ws.bilivideo.com");
-
-    // A host Bilibili picked that is not a PCDN node is not ours to move.
-    const CLEAN_URL = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/1.m4s?deadline=1";
-    const clean = JSON.stringify({ code: 0, data: { dash: { video: [{ baseUrl: CLEAN_URL }] } } });
-
-    // With fan-out off there is nothing to change, so Surge must keep the original
-    // bytes rather than receive a re-encoded body.
-    const untouched = await runSurge({
-      script: { type: "http-response" },
-      request: { url: "https://api.bilibili.com/x/player/playurl?bvid=BV1&cid=1" },
-      response: { status: 200, headers: {}, body: clean },
-      argument: "mode=bad-only&backup_fanout=false"
-    });
-    check("a clean payload passes through untouched", untouched.donePayload, {});
-
-    // With fan-out on the primary is still left alone; alternates are only added.
-    const fanned = await runSurge({
-      script: { type: "http-response" },
-      request: { url: "https://api.bilibili.com/x/player/playurl?bvid=BV1&cid=1" },
-      response: { status: 200, headers: {}, body: clean },
-      argument: "mode=bad-only&backup_fanout=true"
-    });
-    const fannedOut = JSON.parse(fanned.donePayload.body);
-    check("fan-out leaves the primary alone", fannedOut.data.dash.video[0].baseUrl, CLEAN_URL);
-    check("fan-out gives the player alternates", fannedOut.data.dash.video[0].backupUrl.length, 7);
-
-    const other = await runSurge({
-      script: { type: "http-response" },
-      request: { url: "https://api.bilibili.com/x/player/playurl?bvid=BV1&cid=1" },
-      response: { status: 200, headers: {}, body: JSON.stringify({ code: -404, message: "not found" }) },
-      argument: "mode=force"
-    });
-    check("a non-media json body passes through", other.donePayload, {});
-
-    const off = await runSurge({
-      script: { type: "http-response" },
-      request: { url: "https://api.bilibili.com/x/player/playurl?bvid=BV1&cid=1" },
-      response: { status: 200, headers: {}, body },
-      argument: "enabled=false"
-    });
-    check("a disabled script does nothing", off.donePayload, {});
-
-    const live = await runSurge({
-      script: { type: "http-response" },
-      request: { url: "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?room_id=1" },
-      response: {
-        status: 200, headers: {},
-        body: JSON.stringify({
-          code: 0,
-          data: {
-            playurl_info: {
-              playurl: {
-                stream: [{
-                  format: [{
-                    codec: [{
-                      url_info: [
-                        { host: "https://xy1x2x3x4xy.mcdn.bilivideo.cn:486", extra: "?os=mcdn" },
-                        { host: "https://upos-sz-mirrorcos.bilivideo.com", extra: "" }
-                      ]
-                    }]
-                  }]
-                }]
-              }
-            }
-          }
-        })
-      },
-      argument: "mode=force"
-    });
-    const liveOut = JSON.parse(live.donePayload.body);
-    check("the live pcdn entry was dropped",
-      liveOut.data.playurl_info.playurl.stream[0].format[0].codec[0].url_info.length, 1);
-    check("the live response was not host-swapped",
-      liveOut.data.playurl_info.playurl.stream[0].format[0].codec[0].url_info[0].host,
-      "https://upos-sz-mirrorcos.bilivideo.com");
-  }
-
-  // ---- 8. debug switch ----------------------------------------------------
-
-  section("debug switch");
-  {
-    const D_URL = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3-1-30080.m4s?deadline=1&oi=2&os=cos&sign=abc";
-    const payload = JSON.stringify({ code: 0, data: { dash: { video: [{ baseUrl: D_URL }] } } });
-    const rankStore = { [K_RANK]: JSON.stringify({ at: clock.now, via: "sample", ranking: [TARGET, "upos-sz-mirrorcosov.bilivideo.com"], samples: [] }) };
-    const request = { url: "https://api.bilibili.com/x/player/playurl?bvid=BV1&cid=1" };
-    const response = { status: 200, headers: {}, body: payload };
-
-    check("debug defaults to off", api.loadConfig().debug, false);
-
-    // Off: the counters still move, but nothing is posted and nothing is logged.
-    const quiet = await runSurge({
-      script: { type: "http-response" }, request, response,
-      argument: "mode=force", store: Object.assign({}, rankStore)
-    });
-    check("no notification without debug", quiet.notifications.length, 0);
-    const qStats = JSON.parse(quiet.store[K_STATS] || "null");
-    check("a matched response is counted", qStats.calls, 1);
-    check("a media-bearing response is counted", qStats.signals, 1);
-    check("its rewrites are counted", qStats.rewrites, 2);
-    check("the last rewrite records the move",
-      [qStats.last.from, qStats.last.to], ["upos-sz-mirrorcos.bilivideo.com", TARGET]);
-    check("the last rewrite records the reason", qStats.last.reason, "force-host");
-    check("no decision log without debug", quiet.logs.filter((l) => l.indexOf("->") !== -1).length, 0);
-
-    // On: one rate-limited notification plus the per-decision log lines.
-    const loud = await runSurge({
-      script: { type: "http-response" }, request, response,
-      argument: "mode=force&debug=true", store: Object.assign({}, rankStore)
-    });
-    check("one rewrite notification with debug", loud.notifications.length, 1);
-    check("the notification names the target", loud.notifications[0][1], "2 处 → tf-all-hw");
-    check("the notification shows the move with a readable reason", loud.notifications[0][2],
-      "sz-mirrorcos → tf-all-hw（全量改写）");
-    checkTrue("a summary line was logged",
-      loud.logs.some((l) => l.indexOf("rewrites=2") !== -1 && l.indexOf("target=upos-tf-all-hw") !== -1));
-    checkTrue("a detail line was logged",
-      loud.logs.some((l) => l.indexOf("force-host upos-sz-mirrorcos.bilivideo.com -> upos-tf-all-hw.bilivideo.com") !== -1));
-    // Logs get pasted into bug reports; the signed query must never reach them.
+    const loud = await asRequest("http://upos-hz-mirrorakam.akamaized.net/upgcxcode/x", "debug=true");
+    check("debug logs the decision", loud.logs.length, 1);
+    checkTrue("the debug line names the reason and the move",
+      loud.logs[0].indexOf("oversea-video") !== -1 && loud.logs[0].indexOf(DEFAULT_HOST) !== -1);
+    checkTrue("debug lines stay short (Surge elides long ones)", loud.logs[0].length <= 120);
     checkTrue("no signature material is logged",
-      loud.logs.every((l) => l.indexOf("sign=") === -1 && l.indexOf("deadline=") === -1 && l.indexOf("oi=") === -1));
-    // Surge elides the tail of overlong log lines in the request notes (a device capture
-    // showed "...compresse<...14...>", hiding exactly the counters we needed), so the
-    // decision lines have to stay short.
-    checkTrue("decision lines stay inside the notes field (<= 120 chars)",
-      loud.logs.every((l) => l.length <= 120));
+      loud.logs.every((l) => l.indexOf("deadline=") === -1 && l.indexOf("sign=") === -1));
 
-    // A burst of playurl responses must not post a notification each.
-    const burst = await runSurge({
-      script: { type: "http-response" }, request, response,
-      argument: "mode=force&debug=true",
-      store: Object.assign({}, rankStore, { [K_STATS]: loud.store[K_STATS] })
-    });
-    check("the rewrite notification is rate limited", burst.notifications.length, 0);
-    check("but the counters still accumulate", JSON.parse(burst.store[K_STATS]).rewrites, 4);
+    // The app's HTTPDNS shape: the port carries the decision, so it works for an
+    // IP-literal request too.
+    const byIp = await asRequest("http://1.2.3.4:4480/upgcxcode/3.m4s?xy_usource=upos-sz-mirrorhw.bilivideo.com", "");
+    check("an ip-literal pcdn request is still routed by xy_usource",
+      byIp.donePayload.url, "http://upos-sz-mirrorhw.bilivideo.com/upgcxcode/3.m4s?xy_usource=upos-sz-mirrorhw.bilivideo.com");
 
-    // A response that reached the script but carries no media address (an api error,
-    // or an endpoint that is not playurl) must still be counted as a call. Without
-    // that, the panel cannot tell "the script never ran" from "it ran on the wrong
-    // response" — which is exactly the blind spot that made a device report useless.
-    const bare = await runSurge({
-      script: { type: "http-response" }, request,
-      response: { status: 200, headers: {}, body: JSON.stringify({ code: -404, message: "nothing here" }) },
-      argument: "mode=force&debug=true", store: Object.assign({}, rankStore)
-    });
-    const bStats = JSON.parse(bare.store[K_STATS]);
-    check("a non-media response still counts as a call", bStats.calls, 1);
-    check("but not as a media signal", bStats.signals, 0);
-    check("and nothing is rewritten", bStats.rewrites, 0);
-    check("it passes the body through untouched", bare.donePayload, {});
-    checkTrue("the debug line marks it as signal-less",
-      bare.logs.some((l) => l.indexOf("signal=false") !== -1));
-    checkTrue("the debug line records the body length",
-      bare.logs.some((l) => l.indexOf("bytes=") !== -1));
-
-    const empty = await runSurge({
-      script: { type: "http-response" }, request,
-      response: { status: 200, headers: {}, body: "" },
-      argument: "mode=force&debug=true", store: Object.assign({}, rankStore)
-    });
-    check("an empty body still counts as a call", JSON.parse(empty.store[K_STATS]).calls, 1);
-    check("an empty body counts no signal", JSON.parse(empty.store[K_STATS]).signals, 0);
+    const garbage = await asRequest("not a url", "");
+    check("a non-url passes through", garbage.donePayload, {});
   }
 
-  // ---- 9. media layer (http-request) --------------------------------------
-
-  section("media layer");
-  {
-    // Shapes taken from a real device capture: the app's segments are plain http
-    // and land on Akamai, carrying the upos signature plus an Akamai hdnts token.
-    const AKAM = "http://upos-hz-mirrorakam.akamaized.net/upgcxcode/17/75/41787787517/41787787517-1-30232.m4s?deadline=1&os=akam&upsig=abc&hdnts=exp=1~hmac=x";
-    const MCDN = "http://xy1x2x3x4xy.mcdn.bilivideo.cn:486/v1/resource/3-1-30280.m4s?os=mcdn&deadline=1&sign=abc";
-    const rankStore = { [K_RANK]: JSON.stringify({ at: clock.now, via: "sample", ranking: [TARGET, "upos-sz-mirroraliov.bilivideo.com"], samples: [] }) };
-    const asRequest = (url, argument, store) => runSurge({
-      script: { type: "http-request" },
-      request: { url, method: "GET" },
-      argument,
-      store,
-      http: () => { throw new Error("the media layer must never probe"); }
-    });
-
-    // smart 下分片层只修劣质节点：一条分片的主备候选（akam / cosov）如果在请求层被
-    // 一起收敛到同一个主机名，而那个主机名在本地解析到一个没有该域名的边缘节点
-    // （实测 403 X-Tengine-Error: non-existent domain），主备会一起失败，整集放不出来。
-    // 响应层能全量改写是因为那里补得了 backupUrl 扇出，http-request 补不了。
-    const akam = await asRequest(AKAM, "mode=smart", Object.assign({}, rankStore));
-    check("smart mode leaves a healthy akamai segment alone", akam.donePayload, {});
-    check("the media layer never probes", akam.httpCalls.length, 0);
-
-    const backup = "http://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/17/75/41787787517/41787787517-1-30232.m4s?deadline=1&os=cosovbv&upsig=abc&orderid=1,2";
-    const kept = await asRequest(backup, "mode=smart", Object.assign({}, rankStore));
-    check("and leaves the backup candidate native too", kept.donePayload, {});
-
-    // 裸 IP 不是劣质节点：App 的 playurl 会下发 IP 形式的 CDN 地址（实测
-    // 203.121.59.225 = akam 边缘、92.223.116.254 = cosov 边缘，os= 正是 akam / cosovbv），
-    // 那是 App 自己 HTTPDNS 的结果。把它当 PCDN 改写成主机名 = 把能用的地址换成别处。
-    const IPS = "http://203.121.59.225/upgcxcode/17/75/41787787517/41787787517-1-30232.m4s?deadline=1&os=akam&upsig=abc&hdnts=exp=1~hmac=x";
-    const byIp = await asRequest(IPS, "mode=smart", Object.assign({}, rankStore));
-    check("a bare-ip segment is left alone in smart mode", byIp.donePayload, {});
-    const byIpForce = await asRequest(IPS, "mode=force", Object.assign({}, rankStore));
-    check("and in force mode too (an ip is not a bili cdn hostname)", byIpForce.donePayload, {});
-    check("a bare ip is not classified as pcdn",
-      api.classify(api.parseUrl(IPS), api.DEFAULTS).pcdn, false);
-    check("an ip-literal host is still recognised as a media url", api.hasMediaSignal(IPS), true);
-
-    // 全量改写要显式 mode=force：这时播放器手里没有第二条地址，风险由用户承担。
-    const forcedAkam = await asRequest(AKAM, "mode=force", Object.assign({}, rankStore));
-    check("force mode does move the akamai segment", forcedAkam.donePayload.url,
-      AKAM.replace("upos-hz-mirrorakam.akamaized.net", TARGET));
-    check("the media rewrite keeps the http scheme",
-      api.parseUrl(forcedAkam.donePayload.url).scheme, "http");
-    check("the media rewrite keeps the signed query",
-      tailOf(forcedAkam.donePayload.url), tailOf(AKAM));
-
-    // Feeding the result back must not rewrite again: Surge re-runs the script on
-    // the new URL, so a non-idempotent rule would loop.
-    const again = await asRequest(forcedAkam.donePayload.url, "mode=force", Object.assign({}, rankStore));
-    check("the media rewrite is idempotent", again.donePayload, {});
-
-    const smartStats = JSON.parse(akam.store[K_STATS]);
-    check("a smart-mode pass-through still counts the scan", smartStats.mediaCalls, 1);
-    check("but records no rewrite", smartStats.mediaRewrites, 0);
-
-    // Before the first measurement it stays conservative: only pcdn/mcdn move, and
-    // Akamai is not one of those (rewriteAkamai defaults to false).
-    const coldAkam = await asRequest(AKAM, "mode=smart", {});
-    check("akamai is left alone before the first measurement", coldAkam.donePayload, {});
-    const coldMcdn = await asRequest(MCDN, "mode=smart", {});
-    check("an mcdn segment is proxied even before the first measurement",
-      hostOf(coldMcdn.donePayload.url), "proxy-tf-all-ws.bilivideo.com");
-    const mcdnBest = await asRequest(MCDN, "mode=smart&mcdnStrategy=replace", Object.assign({}, rankStore));
-    check("mcdnStrategy=replace swaps mcdn to the measured best instead",
-      hostOf(mcdnBest.donePayload.url), TARGET);
-
-    // 分类目标覆盖：auto 用测速最快，填了主机名就固定用它。分类条件对齐 Redirect。
-    check("category: an *ov mirror is oversea",
-      api.categoryOf("upos-sz-mirrorcosov.bilivideo.com"), "oversea");
-    check("category: a cn-hk-eq node is oversea",
-      api.categoryOf("cn-hk-eq-01.bilivideo.com"), "oversea");
-    check("category: a bstar1 host is bstar",
-      api.categoryOf("upos-sz-mirrorhw.bstar1.bilivideo.com"), "bstar");
-    check("category: a plain mirror is pcdn",
-      api.categoryOf("upos-sz-mirrorcos.bilivideo.com"), "pcdn");
-    check("category: akamai has its own bucket",
-      api.categoryOf("upos-hz-mirrorakam.akamaized.net"), "akamai");
-
-    // Akamai 单独一个开关：填 hostAkamai 就等于"把 akam 换到它"，不需要动 rewriteAkamai。
-    const akamPin = await asRequest(AKAM, "mode=smart&hostAkamai=upos-sz-mirrorhw.bilivideo.com",
-      Object.assign({}, rankStore));
-    check("hostAkamai pins where akam goes",
-      hostOf(akamPin.donePayload.url), "upos-sz-mirrorhw.bilivideo.com");
-    const akamAuto = await asRequest(AKAM, "mode=smart", Object.assign({}, rankStore));
-    check("with hostAkamai=auto akam is left alone", akamAuto.donePayload, {});
-
-    // 分片层的 pattern 只覆盖劣质家族：Surge 每次调用脚本都要重新加载并跑一遍那个 JS VM
-    // （真机实测一次 20–300ms），而分片是一段视频几百上千次请求 —— 让健康分片白交这笔税
-    // 会把播放器填缓冲的节奏拖垮。这条与模块里的 pattern 保持一致，改一边就要改另一边。
-    const MEDIA_PATTERN = new RegExp("^http://(xy(\\d+x){3}\\d+xy\\.mcdn\\.bilivideo\\.(cn|com|net)" +
-      "|upos-sz-mirror14b\\.bilivideo\\.com" +
-      "|[a-zA-Z0-9.-]+\\.(szbdyd\\.com|mountaintoys\\.cn|nexusedgeio\\.com|ahdohpiechei\\.com))[:/]" +
-      "|^http://.*[?&]os=mcdn(&|$)");
-    const MUST_MATCH = [
-      "http://xy1x2x3x4xy.mcdn.bilivideo.cn:486/v1/resource/3-1-30280.m4s?os=mcdn&deadline=1",
-      "http://xy1x2x3x4xy.mcdn.bilivideo.com/v1/resource/3.m4s?deadline=1",
-      "http://upos-sz-mirror14b.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1",
-      "http://foo.szbdyd.com/upgcxcode/1/2/3.m4s?xy_usource=upos-sz-mirrorhw.bilivideo.com",
-      "http://edge.node.mountaintoys.cn/upgcxcode/1/2/3.m4s",
-      "http://node.nexusedgeio.com/upgcxcode/1/2/3.m4s",
-      "http://node.ahdohpiechei.com/upgcxcode/1/2/3.m4s",
-      "http://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&os=mcdn"
-    ];
-    const MUST_NOT_MATCH = [
-      "http://upos-hz-mirrorakam.akamaized.net/upgcxcode/1/2/3.m4s?deadline=1&os=akam",
-      "http://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&os=cosovbv",
-      "http://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&os=cosbv",
-      "http://203.121.59.225/upgcxcode/1/2/3.m4s?deadline=1&os=akam",
-      "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/1/2/3.m4s?deadline=1"
-    ];
-    MUST_MATCH.forEach((u) => checkTrue("the segment pattern still intercepts " + u.slice(0, 46),
-      MEDIA_PATTERN.test(u)));
-    MUST_NOT_MATCH.forEach((u) => checkTrue("the segment pattern skips healthy segment " + u.slice(0, 46),
-      !MEDIA_PATTERN.test(u)));
-
-    const OV = "http://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&sign=abc";
-    const ovAuto = await asRequest(OV, "mode=smart", Object.assign({}, rankStore));
-    check("smart mode leaves a healthy oversea host alone too", ovAuto.donePayload, {});
-    const ovForce = await asRequest(OV, "mode=force", Object.assign({}, rankStore));
-    check("an oversea host follows the ranking in force mode",
-      hostOf(ovForce.donePayload.url), TARGET);
-    // 手填的分类目标是显式意图，不是测速猜的，分片层在 smart 下也照办。
-    const ovPin = await asRequest(OV, "mode=smart&hostOversea=upos-hw.bilivideo.com",
-      Object.assign({}, rankStore));
-    check("a pinned oversea target overrides the ranking",
-      hostOf(ovPin.donePayload.url), "upos-hw.bilivideo.com");
-
-    const BS = "http://upos-sz-mirrorhw.bstar1.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&sign=abc";
-    const bsPin = await asRequest(BS, "mode=smart&hostBStar=upos-hw.bilivideo.com",
-      Object.assign({}, rankStore));
-    check("a pinned bstar target overrides the ranking",
-      hostOf(bsPin.donePayload.url), "upos-hw.bilivideo.com");
-
-    const notMedia = await asRequest(
-      "http://upos-sz-mirrorcos.bilivideo.com/api/ping", "mode=smart", Object.assign({}, rankStore));
-    check("a non-media request on a cdn host is left alone", notMedia.donePayload, {});
-
-    const offLayer = await asRequest(AKAM, "mode=smart&mediaRewrite=false", Object.assign({}, rankStore));
-    check("mediaRewrite=false disables the layer", offLayer.donePayload, {});
-
-    const counted = JSON.parse(forcedAkam.store[K_STATS]);
-    check("a media call is counted", counted.mediaCalls, 1);
-    check("a media rewrite is counted", counted.mediaRewrites, 1);
-    check("the media layer leaves the payload counters alone", counted.calls, 0);
-    check("the media rewrite becomes the last recorded move",
-      [counted.last.from, counted.last.to], ["upos-hz-mirrorakam.akamaized.net", TARGET]);
-  }
-
-  // ---- 10. gRPC / protobuf layer ------------------------------------------
-
-  section("gRPC protobuf layer");
-  {
-    // Minimal protobuf codec, used both to build fixtures and to verify that the
-    // rewritten body still parses back to the same structure.
-    const vint = (n) => { const o = []; let v = n; do { const b = v % 128; v = Math.floor(v / 128); o.push(v > 0 ? b + 128 : b); } while (v > 0); return o; };
-    const asc = (s) => Array.from(s).map((c) => c.charCodeAt(0));
-    const ldf = (no, payload) => vint((no << 3) | 2).concat(vint(payload.length), payload);
-    const sfield = (no, s) => ldf(no, asc(s));
-    const readVint = (buf, pos) => {
-      let v = 0, sh = 0;
-      while (pos < buf.length) {
-        const b = buf[pos++];
-        v += (b & 127) * Math.pow(2, sh);
-        if (!(b & 128)) return { value: v, next: pos };
-        sh += 7;
-      }
-      return null;
-    };
-    function collect(buf, start, end, out, depth) {
-      let pos = start;
-      while (pos < end) {
-        const tag = readVint(buf, pos);
-        if (!tag) return false;
-        pos = tag.next;
-        const wire = tag.value & 7;
-        if (wire === 0) { const v = readVint(buf, pos); if (!v) return false; pos = v.next; }
-        else if (wire === 1) pos += 8;
-        else if (wire === 5) pos += 4;
-        else if (wire === 2) {
-          const len = readVint(buf, pos);
-          if (!len) return false;
-          const ps = len.next, pe = ps + len.value;
-          if (pe > end) return false;
-          const sub = [];
-          if (depth < 12 && collect(buf, ps, pe, sub, depth + 1)) out.push(...sub);
-          else out.push(String.fromCharCode.apply(null, Array.from(buf.slice(ps, pe))));
-          pos = pe;
-        } else return false;
-      }
-      return pos === end;
-    }
-    const stringsOf = (buf) => { const out = []; collect(buf, 0, buf.length, out, 0); return out; };
-    const hasBytes = (buf, s) => {
-      const n = asc(s);
-      outer: for (let i = 0; i + n.length <= buf.length; i++) {
-        for (let k = 0; k < n.length; k++) if (buf[i + k] !== n[k]) continue outer;
-        return true;
-      }
-      return false;
-    };
-
-    const AKAM = "upos-hz-mirrorakam.akamaized.net";        // 32 字符
-    const COSOV = "upos-sz-mirrorcosov.bilivideo.com";      // 33 字符，与 aliov 等长
-    const ALIOV = "upos-sz-mirroraliov.bilivideo.com";
-    const urlOf = (h) => "http://" + h + "/upgcxcode/1/2/3.m4s?deadline=1&upsig=abc";
-    const mkBody = (host) => new Uint8Array([].concat(
-      sfield(1, "playurl-id"),
-      ldf(2, [].concat(sfield(1, urlOf(host)), sfield(3, "backup"))),
-      sfield(4, "tail")
-    ));
-    // gRPC framing: 1 byte compression flag + 4 byte big-endian length + message.
-    const be32 = (n) => [Math.floor(n / 16777216) % 256, Math.floor(n / 65536) % 256, Math.floor(n / 256) % 256, n % 256];
-    const frame = (msg, flag) => [].concat([flag || 0], be32(msg.length), msg);
-    const framed = (host) => new Uint8Array(frame(Array.from(mkBody(host))));
-    const fresh = () => ({ count: 0, reasons: {}, details: [], grpcRewrites: 0 });
-    const cfg = Object.assign({}, api.DEFAULTS, { mode: "smart" });
-    // 显式开了 rewriteAkamai 或指定了分类目标时，字节层才会动健康节点
-    const cfgMove = Object.assign({}, cfg, { rewriteAkamai: true, hostOversea: ALIOV });
-    const ranked = { ranking: [ALIOV] };
-    const cold = null;
-
-    // Equal-length swap: only the host bytes change, every length prefix stays put.
-    const eqStats = fresh();
-    const eq2 = api.rewriteProto(mkBody(COSOV), cfgMove, ranked, eqStats);
-    check("equal-length swap rewrites exactly one host", eqStats.grpcRewrites, 1);
-    check("equal-length swap keeps the body size", eq2.length, mkBody(COSOV).length);
-    check("the rewritten body parses back with the new host",
-      stringsOf(eq2), ["playurl-id", urlOf(ALIOV), "backup", "tail"]);
-
-    // Unequal swap: the host grows by one byte, so the enclosing length prefixes
-    // (both the nested message and the string field) must be rewritten too.
-    const src = mkBody(AKAM);
-    const st = fresh();
-    const out = api.rewriteProto(src, cfgMove, ranked, st);
-    check("unequal-length swap grows by exactly the host delta",
-      out.length - src.length, ALIOV.length - AKAM.length);
-    check("the resized body still parses back",
-      stringsOf(out), ["playurl-id", urlOf(ALIOV), "backup", "tail"]);
-
-    // Identity preservation is the safety property: nothing swappable means the
-    // original bytes must be returned untouched (null, i.e. passthrough).
-    check("a body whose only host is already the target is untouched",
-      api.rewriteProto(mkBody(ALIOV), cfg, ranked, fresh()), null);
-    check("a body with no CDN host is untouched",
-      api.rewriteProto(new Uint8Array([].concat(sfield(1, "x"), sfield(2, "https://i0.hdslb.com/bfs/a.jpg"))),
-        cfg, ranked, fresh()), null);
-    check("a body that is not protobuf is untouched",
-      api.rewriteProto(new Uint8Array([].concat([7, 7, 7], asc(urlOf(AKAM)), [255])), cfg, ranked, fresh()), null);
-
-    // Policy mirrors the other layers: akamai only moves once something was measured.
-    check("akamai is left alone before the first measurement",
-      api.rewriteProto(mkBody(AKAM), cfg, cold, fresh()), null);
-    // 字节层默认不动健康节点：JSON 层能补 backupUrl，protobuf 补不了，收敛到单一 host
-    // 等于拆掉播放器的多 CDN 容错（一处抖动就卡一段）。"选最快"交给分片层。
-    check("the byte layer leaves a healthy mirror alone even when ranked",
-      api.rewriteProto(mkBody(COSOV), cfg, ranked, fresh()), null);
-    checkTrue("akamai moves once rewriteAkamai is on",
-      api.rewriteProto(mkBody(AKAM), cfgMove, ranked, fresh()) !== null);
-    // hostAkamai 单独就能让字节层换掉 akam（App 的 playurl 里 akam 是候选之一）。
-    const akamByte = Object.assign({}, cfg, { hostAkamai: ALIOV });
-    checkTrue("hostAkamai alone moves akam in the byte layer",
-      api.rewriteProto(mkBody(AKAM), akamByte, ranked, fresh()) !== null);
-    checkTrue("a pinned category target moves healthy hosts too",
-      api.rewriteProto(mkBody(COSOV), cfgMove, ranked, fresh()) !== null);
-    checkTrue("an mcdn host moves even without a ranking",
-      api.rewriteProto(mkBody("xy1x2x3x4xy.mcdn.bilivideo.cn"), cfg, cold, fresh()) !== null);
-
-    // Several URLs in one message all get rewritten.
-    const multi = new Uint8Array([].concat(sfield(1, urlOf(COSOV)), sfield(2, urlOf(COSOV))));
-    const mst = fresh();
-    api.rewriteProto(multi, cfgMove, ranked, mst);
-    check("every occurrence in the message is swapped", mst.grpcRewrites, 2);
-
-    // The real body is a stream of gRPC frames, not a bare message. Treating it as
-    // a bare message makes the parser reject byte 0 (the flag) and rewrite nothing —
-    // which is exactly what an on-device run showed (13 calls, 0 rewrites).
-    const f1s = fresh();
-    const f1 = api.rewriteGrpcBody(framed(COSOV), cfgMove, ranked, f1s);
-    check("a gRPC frame is rewritten", f1s.grpcRewrites, 1);
-    check("the frame stream is reported", [f1.frames, f1.compressed, f1.framed], [1, 0, true]);
-    check("an equal-length swap keeps the frame size", f1.out.length, framed(COSOV).length);
-    check("the framed message parses back",
-      stringsOf(f1.out.slice(5)), ["playurl-id", urlOf(ALIOV), "backup", "tail"]);
-
-    const f2s = fresh();
-    const f2 = api.rewriteGrpcBody(framed(AKAM), cfgMove, ranked, f2s);
-    check("a resized frame grows by the host delta",
-      f2.out.length - framed(AKAM).length, ALIOV.length - AKAM.length);
-    check("the resized frame still parses back",
-      stringsOf(f2.out.slice(5)), ["playurl-id", urlOf(ALIOV), "backup", "tail"]);
-
-    const two = new Uint8Array([].concat(
-      frame(Array.from(mkBody(COSOV))), frame(Array.from(mkBody(COSOV)))));
-    const f3s = fresh();
-    const f3 = api.rewriteGrpcBody(two, cfgMove, ranked, f3s);
-    check("every frame is scanned", f3.frames, 2);
-    check("every frame is rewritten", f3s.grpcRewrites, 2);
-
-    // A compressed frame cannot be recompressed here, so it must be left intact and
-    // reported — silently dropping it would look identical to "nothing matched".
-    const gzFrame = new Uint8Array(frame([31, 139, 8, 0, 1, 2, 3], 1));
-    const f4 = api.rewriteGrpcBody(gzFrame, cfg, ranked, fresh());
-    check("a compressed frame is left as is", f4.out, null);
-    check("the compressed frame is counted", f4.compressed, 1);
-    check("and nothing was unzipped by default", f4.unzipped, 0);
-
-    // 官方 App 的 playurl 实测 100% 是 gzip 帧（5/5：2990B → 12476B），不解压就一次也
-    // 改不动。grpcGunzip 打开后：解压 → 改写 → 这一帧按"未压缩帧"（flag=0）发回去。
-    const gzPlain = mkBody(COSOV);
-    const gzCfg = Object.assign({}, cfgMove, { grpcGunzip: true });
-    window.$utils = { ungzip: () => gzPlain };
-    const f5s = fresh();
-    const f5 = api.rewriteGrpcBody(gzFrame, gzCfg, ranked, f5s);
-    check("with grpcGunzip the frame is rewritten", f5s.grpcRewrites, 1);
-    check("the rewritten frame is re-emitted uncompressed",
-      [f5.out[0], f5.frames, f5.unzipped], [0, 1, 1]);
-    check("its length prefix matches the decompressed message",
-      f5.out.length, 5 + gzPlain.length);
-    check("the uncompressed frame carries the new host",
-      stringsOf(f5.out.slice(5)), ["playurl-id", urlOf(ALIOV), "backup", "tail"]);
-
-    // 解压失败、或者 $utils 根本没有（老版本 Surge）时，帧必须原样保留。
-    window.$utils = { ungzip: () => null };
-    check("a failed ungzip leaves the frame alone",
-      api.rewriteGrpcBody(gzFrame, gzCfg, ranked, fresh()).out, null);
-    window.$utils = { ungzip: () => [1, 2, 3] };
-    check("an ungzip result that is not a message leaves the frame alone",
-      api.rewriteGrpcBody(gzFrame, gzCfg, ranked, fresh()).out, null);
-    delete window.$utils;
-    check("without $utils a compressed frame stays compressed",
-      api.rewriteGrpcBody(gzFrame, gzCfg, ranked, fresh()).out, null);
-
-    // 裸 IP 在字节层同样不换：App 下发 IP 形式的 CDN 地址时，换成主机名会 403。
-    const ipBody = new Uint8Array([].concat(
-      sfield(1, "playurl-id"),
-      sfield(2, "http://203.121.59.225/upgcxcode/1/2/3.m4s?deadline=1&os=akam&upsig=abc")));
-    check("a bare-ip url inside a protobuf body is untouched",
-      api.rewriteProto(ipBody, cfg, ranked, fresh()), null);
-
-    check("a truncated frame stream is not touched",
-      api.rewriteGrpcBody(new Uint8Array([].concat(frame(Array.from(mkBody(COSOV))), [0, 0, 0])),
-        cfg, ranked, fresh()).out, null);
-    check("a bare message is not mistaken for a frame stream",
-      api.rewriteGrpcBody(mkBody(COSOV), cfg, ranked, fresh()).framed, false);
-
-    // End to end: a binary body must take the gRPC path and come back as bytes.
-    const run = await runSurge({
-      script: { type: "http-response" },
-      request: { url: "https://grpc.biliapi.net/bilibili.app.playerunite.v1.Player/PlayViewUnite" },
-      response: { status: 200, headers: {}, body: framed(COSOV) },
-      argument: "mode=smart&hostOversea=upos-sz-mirroraliov.bilivideo.com",
-      store: { [K_RANK]: JSON.stringify({ at: clock.now, via: "sample", ranking: [ALIOV], samples: [] }) }
-    });
-    checkTrue("a binary body comes back rewritten", hasBytes(run.donePayload.body, urlOf(ALIOV)));
-    check("the gRPC call is counted", JSON.parse(run.store[K_STATS]).grpcCalls, 1);
-    check("the gRPC rewrite is counted", JSON.parse(run.store[K_STATS]).grpcRewrites, 1);
-    check("the gRPC layer leaves the payload counters alone", JSON.parse(run.store[K_STATS]).calls, 0);
-    // The frame structure of the last response is kept so the panel can explain a
-    // zero rewrite count without anyone having to find the log.
-    const lastG = JSON.parse(run.store[K_STATS]).grpcLast;
-    check("the last gRPC frame structure is recorded",
-      [lastG.frames, lastG.framed, lastG.rewrites], [1, true, 1]);
-
-    const runOff = await runSurge({
-      script: { type: "http-response" },
-      request: { url: "https://grpc.biliapi.net/bilibili.app.playurl.v1.PlayURL/PlayConf" },
-      response: { status: 200, headers: {}, body: framed(COSOV) },
-      argument: "mode=smart&grpcRewrite=false",
-      store: { [K_RANK]: JSON.stringify({ at: clock.now, via: "sample", ranking: [ALIOV], samples: [] }) }
-    });
-    check("grpcRewrite=false leaves the body alone", runOff.donePayload, {});
-    check("but the gRPC call is still counted", JSON.parse(runOff.store[K_STATS]).grpcCalls, 1);
-
-    // A compressed frame cannot be recompressed, so it must pass through and the
-    // debug line has to say so — otherwise it looks identical to "no host matched".
-    const runGz = await runSurge({
-      script: { type: "http-response" },
-      request: { url: "https://grpc.biliapi.net/bilibili.app.playerunite.v1.Player/PlayViewUnite" },
-      response: { status: 200, headers: {}, body: new Uint8Array(frame([31, 139, 8, 0, 1, 2, 3], 1)) },
-      argument: "mode=smart&debug=true",
-      store: { [K_RANK]: JSON.stringify({ at: clock.now, via: "sample", ranking: [ALIOV], samples: [] }) }
-    });
-    check("a compressed gRPC body passes through", runGz.donePayload, {});
-    checkTrue("and the compressed frame is logged",
-      runGz.logs.some((l) => l.indexOf("compressed=1") !== -1));
-    checkTrue("the debug line reports the frame count",
-      runGz.logs.some((l) => l.indexOf("frames=1") !== -1));
-    // 同上：不要把签名/主机名塞进这一行，否则 Surge 会把计数掐掉。
-    checkTrue("the grpc debug line stays short",
-      runGz.logs.every((l) => l.length <= 120));
-    checkTrue("the grpc debug line no longer repeats the request url",
-      runGz.logs.every((l) => l.indexOf("biliapi.net") === -1));
-  }
-
-  // ---- 11. panel role -----------------------------------------------------
+  // ---- 6. the panel role --------------------------------------------------
 
   section("panel role");
   {
-    const panelInput = { purpose: "panel", position: "policy-selection", panelName: "BiliFastCDN" };
-    const rankStore = { [K_RANK]: JSON.stringify({ at: clock.now, via: "sample", ranking: [TARGET, "upos-sz-mirrorcosov.bilivideo.com"], samples: [{ host: TARGET, mbps: 41.9, ms: 251 }] }) };
-    const anyProbe = (opts) => {
-      if (opts.url.indexOf("/x/web-interface/popular") !== -1) {
-        return { status: 200, data: JSON.stringify({ data: { list: [{ bvid: "BV1abc", cid: 99 }] } }) };
-      }
-      if (opts.url.indexOf("/x/player/playurl") !== -1) {
-        return { status: 200, data: JSON.stringify({ data: { dash: { video: [{ baseUrl: "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&sign=abc" }] } } }) };
-      }
-      return { status: 200, delay: 20, data: "x".repeat(262144) };
-    };
+    const input = { purpose: "panel", position: "policy-selection", panelName: "BiliFastCDN" };
+    const idle = await runSurge({ input, argument: "hostMcdn=proxy-tf-all-ws.bilivideo.com" });
+    check("the panel title carries the version", idle.donePayload.title, "B站CDN v" + api.VERSION);
+    checkTrue("it shows the static target", idle.donePayload.content.indexOf("sz-mirrorali") !== -1);
+    checkTrue("it shows the script counters", idle.donePayload.content.indexOf("脚本 命中0 改写0") !== -1);
+    check("style is info before any rewrite", idle.donePayload.style, "info");
+    checkTrue("it explains that regular mirrors are handled by the static rules",
+      idle.donePayload.content.indexOf("静态规则") !== -1);
 
-    // Opening the dashboard must never start a probe round on its own.
-    const idle = await runSurge({
-      script: { type: "generic" }, input: panelInput, trigger: "auto-interval",
-      argument: "mode=smart&notify=false",
-      http: () => { throw new Error("an idle panel refresh must not probe"); }
-    });
-    check("the panel title carries the script version", idle.donePayload.title, "B站CDN v" + api.VERSION);
-    checkTrue("it says it has not been measured yet",
-      idle.donePayload.content.indexOf("尚未测速") !== -1);
-    checkTrue("it tells the user how to measure",
-      idle.donePayload.content.indexOf("点刷新按钮") !== -1);
-    check("an idle refresh makes no requests", idle.httpCalls.length, 0);
-
-    // Tapping refresh is the deliberate "test now" trigger.
-    const tapped = await runSurge({
-      script: { type: "generic" }, input: panelInput, trigger: "button",
-      argument: "mode=smart&notify=false", http: anyProbe
-    });
-    checkTrue("a tapped refresh probed", tapped.httpCalls.length > 0);
-    checkTrue("it stored a ranking", !!tapped.store[K_RANK]);
-    checkTrue("it reports the chosen host",
-      tapped.donePayload.content.indexOf(shorten(JSON.parse(tapped.store[K_RANK]).ranking[0])) !== -1);
-    checkTrue("it reports a measured rate", tapped.donePayload.content.indexOf("Mbps") !== -1);
-    // Traffic has not been rewritten yet in this run, so it points at MitM.
-    check("style is info before any rewrite", tapped.donePayload.style, "info");
-    checkTrue("it says no traffic arrived at all",
-      tapped.donePayload.content.indexOf("未收到任何流量") !== -1);
-    checkTrue("and points at the MitM switch",
-      tapped.donePayload.content.indexOf("MitM") !== -1);
-
-    // With rewrites on the record the panel turns green and shows the counters.
-    const reported = await runSurge({
-      script: { type: "generic" }, input: panelInput, trigger: "auto-interval",
-      argument: "mode=smart&notify=false",
-      store: Object.assign({}, rankStore, {
-        [K_STATS]: JSON.stringify({
-          calls: 12, signals: 9, rewrites: 27, liveDropped: 3, grpcCalls: 23, grpcRewrites: 21,
-          grpcLast: { at: clock.now, bytes: 41984, frames: 1, compressed: 0, framed: true, rewrites: 21 },
-          mediaCalls: 156, mediaRewrites: 150,
-          last: { reason: "force-host", from: "upos-sz-mirrorcos.bilivideo.com", to: TARGET, at: clock.now },
-          lastNotifyAt: 0
-        })
-      }),
-      http: () => { throw new Error("reporting must not probe"); }
-    });
-    check("style is good once rewrites happen", reported.donePayload.style, "good");
-    checkTrue("it shows the payload layer counters",
-      reported.donePayload.content.indexOf("接口 触发12 媒体9 改写27") !== -1);
-    checkTrue("it shows the gRPC layer counters and the last frame shape",
-      reported.donePayload.content.indexOf("gRPC 扫描23 改写21 · 最近 41KB 帧1 改写21") !== -1);
-    checkTrue("it shows the media layer counters separately",
-      reported.donePayload.content.indexOf("分片 扫描156 改写150") !== -1);
-    checkTrue("it shows the last move", reported.donePayload.content.indexOf("最近 全量改写：sz-mirrorcos → tf-all-hw") !== -1);
-    checkTrue("it shows the live filtering", reported.donePayload.content.indexOf("直播剔除3") !== -1);
-    check("no requests when only reporting", reported.httpCalls.length, 0);
-
-    // Traffic that needed no rewrite is a different situation from no traffic.
-    const noNeed = await runSurge({
-      script: { type: "generic" }, input: panelInput, trigger: "auto-interval",
-      argument: "mode=bad-only&notify=false",
-      store: Object.assign({}, rankStore, {
-        [K_STATS]: JSON.stringify({ calls: 4, signals: 4, rewrites: 0, liveDropped: 0, last: null, lastNotifyAt: 0 })
-      }),
-      http: () => { throw new Error("reporting must not probe"); }
-    });
-    check("style stays info when nothing needed rewriting", noNeed.donePayload.style, "info");
-    checkTrue("it explains that nothing needed rewriting",
-      noNeed.donePayload.content.indexOf("无需改写") !== -1);
-
-    // Fired but the bodies carried no media address: a different fault from "never
-    // fired", and a different hint has to be shown.
-    const partial = await runSurge({
-      script: { type: "generic" }, input: panelInput, trigger: "auto-interval",
-      argument: "mode=smart&notify=false",
-      store: Object.assign({}, rankStore, {
-        [K_STATS]: JSON.stringify({ calls: 6, signals: 0, rewrites: 0, liveDropped: 0, last: null, lastNotifyAt: 0 })
-      }),
-      http: () => { throw new Error("reporting must not probe"); }
-    });
-    check("style stays info when bodies carried no media", partial.donePayload.style, "info");
-    checkTrue("it says the response had no media address",
-      partial.donePayload.content.indexOf("没有媒体地址") !== -1);
-    checkTrue("and does not blame MitM for it",
-      partial.donePayload.content.indexOf("未收到任何流量") === -1);
-
-    // 分片层在 smart 下扫描有数、改写 0 是常态：卡片得自己说明，否则又会被当成"没生效"。
-    const mediaIdle = await runSurge({
-      script: { type: "generic" }, input: panelInput, trigger: "auto-interval",
-      argument: "mode=smart&notify=false",
-      store: Object.assign({}, rankStore, {
-        [K_STATS]: JSON.stringify({
-          calls: 0, signals: 0, rewrites: 0, liveDropped: 0, grpcCalls: 0, grpcRewrites: 0,
-          mediaCalls: 41, mediaRewrites: 0, last: null, lastNotifyAt: 0
-        })
-      }),
-      http: () => { throw new Error("reporting must not probe"); }
-    });
-    checkTrue("the panel says why the media layer rewrote nothing",
-      mediaIdle.donePayload.content.indexOf("分片 smart 只修劣质节点") !== -1);
-    checkTrue("it does not claim the module is idle",
-      mediaIdle.donePayload.content.indexOf("未收到任何流量") === -1);
-
-    // 测速时被否掉的候选要能在卡片上看到，否则目标换了名字也没有解释。
-    const withReject = await runSurge({
-      script: { type: "generic" }, input: panelInput, trigger: "auto-interval",
-      argument: "mode=smart&notify=false",
+    const busy = await runSurge({
+      input,
+      argument: "hostOverseaVideo=upos-sz-mirrorhw.bilivideo.com",
       store: {
-        [K_RANK]: JSON.stringify({
-          at: clock.now, via: "sample", ranking: [TARGET],
-          samples: [{ host: TARGET, mbps: 41.9, ms: 251 }],
-          rejected: [{ host: "upos-sz-mirroraliov.bilivideo.com", status: 403 }]
+        [K_STATS]: JSON.stringify({
+          calls: 9, rewrites: 4,
+          reasons: { "mcdn-port": 3, "pcdn-upsource": 1 },
+          last: { reason: "mcdn-port", from: "xy1x2x3x4xy.mcdn.bilivideo.cn",
+            to: "xy1x2x3x4xy.mcdn.bilivideo.cn:9102", at: clock.now }
         })
-      },
-      http: () => { throw new Error("reporting must not probe"); }
+      }
     });
-    checkTrue("the panel names a rejected candidate and its status",
-      withReject.donePayload.content.indexOf("剔除 sz-mirroraliov(403)") !== -1);
-
-    const offPanel = await runSurge({
-      script: { type: "generic" }, input: panelInput, trigger: "button",
-      argument: "enabled=false",
-      http: () => { throw new Error("a disabled panel must not probe"); }
-    });
-    check("a disabled panel reports alert", offPanel.donePayload.style, "alert");
-    check("a disabled panel makes no requests", offPanel.httpCalls.length, 0);
+    checkTrue("it shows the counters", busy.donePayload.content.indexOf("脚本 命中9 改写4") !== -1);
+    checkTrue("it shows the configured target", busy.donePayload.content.indexOf("sz-mirrorhw") !== -1);
+    checkTrue("it shows the last move with a readable reason",
+      busy.donePayload.content.indexOf("最近 MCDN换端口：") !== -1);
+    check("style turns good once something was rewritten", busy.donePayload.style, "good");
+    check("the panel makes no requests", busy.doneCount, 1);
   }
 
-  // ---- 10. cron role, end to end ------------------------------------------
+  // ---- 7. the module file matches the script ------------------------------
 
-  section("cron role");
+  section("module file");
   {
-    const SPEEDS = {
-      "upos-sz-mirrorcosov.bilivideo.com": { status: 200, delay: 500 },
-      "upos-sz-mirroraliov.bilivideo.com": { status: 200, delay: 1100 },
-      "upos-sz-mirrorhwov.bilivideo.com": { status: 200, delay: 750 },
-      "upos-sz-mirrorali.bilivideo.com": { status: 200, delay: 400 },
-      "upos-tf-all-hw.bilivideo.com": { status: 200, delay: 100 },
-      "upos-sz-mirrorhw.bilivideo.com": { status: 200, delay: 250 },
-      "upos-sz-mirrorcos.bilivideo.com": { status: 200, delay: 600 },
-      "upos-tf-all-tx.bilivideo.com": { status: 200, delay: 900 }
-    };
-    const SEGMENT = "x".repeat(262144); // 256 KB of "video"
+    const moduleLines = MODULE.split("\n");
+    const rules = moduleLines.filter((l) => /^\^https?:/.test(l));
+    check("12 static rewrite rules (http + https for each family)", rules.length, 12);
+    checkTrue("they target the oversea parameter",
+      rules.every((l) => l.indexOf("{{{hostOverseaVideo}}}") !== -1 || l.indexOf("{{{hostBStar}}}") !== -1));
+    checkTrue("every rule uses the host-rewrite type", rules.every((l) => l.indexOf(" header") !== -1));
+    checkTrue("akam has its own rules", rules.some((l) => l.indexOf("upos-hz-mirrorakam") !== -1));
+    checkTrue("the stray ports are forced through the http engine",
+      /force-http-engine-hosts[\s\S]*\*:4480[\s\S]*\*:4483[\s\S]*\*:8000[\s\S]*\*:8082[\s\S]*\*:9102/.test(MODULE));
+    checkTrue("mcdn and pcdn are the only request scripts",
+      /BiliFastCDN-MCDN = type=http-request/.test(MODULE) && /BiliFastCDN-PCDN = type=http-request/.test(MODULE));
+    checkTrue("the panel script is generic", /BiliFastCDN-Panel = type=generic/.test(MODULE));
+    checkTrue("the panel section points at it", /script-name=BiliFastCDN-Panel/.test(MODULE));
+    checkTrue("mitm covers the rewrite targets", /\[MITM\][\s\S]*upos-sz-mirror\*\.bilivideo\.com/.test(MODULE));
 
-    function responder(opts, overrides) {
-      if (opts.url.indexOf("/x/web-interface/popular") !== -1) {
-        return { status: 200, data: JSON.stringify({ data: { list: [{ bvid: "BV1abc", cid: 99 }] } }) };
-      }
-      if (opts.url.indexOf("/x/player/playurl") !== -1) {
-        return {
-          status: 200,
-          data: JSON.stringify({
-            data: { dash: { video: [{ baseUrl: "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&sign=abc" }] } }
-          })
-        };
-      }
-      const spec = (overrides && overrides[hostOf(opts.url)]) || SPEEDS[hostOf(opts.url)] || { status: 500, delay: 10 };
-      return {
-        status: spec.status,
-        delay: spec.delay,
-        data: opts.url.indexOf("/upgcxcode/") !== -1 ? SEGMENT : "<html>forbidden</html>"
-      };
-    }
-
-    // No ranking and no sample stored: the script has to bootstrap one from the
-    // public api, then rank the pool by measured throughput.
-    const boot = await runSurge({
-      script: { type: "cron" },
-      argument: "notify=true&debug=true",
-      http: (opts) => responder(opts)
+    // no leftovers from the previous engine
+    ["grpcRewrite", "grpcGunzip", "mediaRewrite", "mcdnStrategy", "backupFanout",
+      "type=cron", "type=http-response", "enabled=", "mode="].forEach((token) => {
+      checkTrue("the old engine's " + token + " is gone", MODULE.indexOf(token) === -1);
     });
-    check("cron finished once", boot.doneCount, 1);
-    checkTrue("a ranking was stored", !!boot.store[K_RANK]);
-    let rank = JSON.parse(boot.store[K_RANK] || "{}");
-    check("ranked via a signed sample", rank.via, "sample");
-    check("every pool host ranked", rank.ranking.length, 8);
-    check("fastest host first", rank.ranking[0], "upos-tf-all-hw.bilivideo.com");
-    check("slowest host last", rank.ranking[7], "upos-sz-mirroraliov.bilivideo.com");
-    checkTrue("a signed sample was cached", !!boot.store[K_SAMPLE]);
-    checkTrue("the bootstrap asked for a popular video",
-      boot.httpCalls.some((o) => o.url.indexOf("/x/web-interface/popular") !== -1));
-    const probeCall = boot.httpCalls.filter((o) => o.url.indexOf("/upgcxcode/") !== -1)[0];
-    checkTrue("a probe re-requested the signed segment", !!probeCall);
-    check("a probe asked for a bounded range", probeCall.headers.Range, "bytes=0-1048575");
-    check("a probe carried a referer", probeCall.headers.Referer, "https://www.bilibili.com/");
-    // $httpClient's timeout is in seconds. Milliseconds here would be accepted
-    // silently and hang the cron until Surge killed it.
-    checkTrue("every request used a seconds-scale timeout",
-      boot.httpCalls.every((o) => typeof o.timeout === "number" && o.timeout > 0 && o.timeout <= 30));
-    checkTrue("every pool host was probed",
-      api.CANDIDATE_POOL.every((h) => boot.httpCalls.some((o) => hostOf(o.url) === h)));
-    check("one notification", boot.notifications.length, 1);
-    checkTrue("the notification names the winner", boot.notifications[0][1].indexOf("tf-all-hw") !== -1);
-    // Debug narrates every measurement, including the hosts that lost.
-    check("every probe was logged",
-      boot.logs.filter((l) => l.indexOf("probe: upos-") !== -1).length, 8);
-    checkTrue("the winner's measured rate was logged",
-      boot.logs.some((l) => l.indexOf("probe: upos-tf-all-hw.bilivideo.com") !== -1 && l.indexOf("Mbps") !== -1));
-    check("debug lists the whole pool in the notification",
-      boot.notifications[0][2].split("\n").length, 8);
 
-    // A fresh ranking must cost nothing.
-    const fresh = await runSurge({
-      script: { type: "cron" },
-      argument: "notify=true",
-      store: { [K_RANK]: JSON.stringify({ at: clock.now, via: "sample", ranking: [TARGET], samples: [] }) },
-      http: () => { throw new Error("a fresh ranking must not probe"); }
-    });
-    check("a fresh ranking short-circuits", fresh.doneCount, 1);
-    check("no requests were made", fresh.httpCalls.length, 0);
-    check("the ranking was left alone", JSON.parse(fresh.store[K_RANK]).ranking[0], TARGET);
-
-    // The cached signature expired: every host rejects it. The module has to drop
-    // the sample and fall back to latency rather than store an empty ranking.
-    const forbidden = {};
-    api.CANDIDATE_POOL.forEach((h) => { forbidden[h] = { status: 403, delay: 50 }; });
-    const expired = await runSurge({
-      script: { type: "cron" },
-      argument: "notify=false",
-      store: {
-        [K_SAMPLE]: JSON.stringify({ at: clock.now, url: "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&sign=abc" })
-      },
-      http: (opts) => responder(opts, forbidden)
-    });
-    check("cron finished once", expired.doneCount, 1);
-    check("the rejected sample was dropped", expired.store[K_SAMPLE], "");
-    rank = JSON.parse(expired.store[K_RANK] || "{}");
-    check("fell back to latency ranking", rank.via, "rtt");
-    check("the latency ranking covers the pool", rank.ranking.length, 8);
-    check("no notification when notify=false", expired.notifications.length, 0);
-    checkTrue("latency probed the bare host path",
-      expired.httpCalls.some((o) => o.url === "https://" + TARGET + "/"));
-    checkTrue("the sample round ran first", expired.httpCalls[0].url.indexOf("/upgcxcode/") !== -1);
-
-    // 一个候选在测速时 403（实测形态：本地 DNS 把 *ov 镜像指到一个没有该域名的 CDN
-    // 边缘，返回 X-Tengine-Error: non-existent domain）。它必须被剔出排名，而且要留痕 ——
-    // 否则用户只看到"目标节点"换了个名字，猜不到自己选的那个当场就被否了。
-    const oneForbidden = { "upos-sz-mirroraliov.bilivideo.com": { status: 403, delay: 30 } };
-    const partial = await runSurge({
-      script: { type: "cron" },
-      argument: "notify=false",
-      store: {
-        [K_SAMPLE]: JSON.stringify({ at: clock.now, url: "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&sign=abc" })
-      },
-      http: (opts) => responder(opts, oneForbidden)
-    });
-    rank = JSON.parse(partial.store[K_RANK] || "{}");
-    check("a host that 403s is kept out of the ranking",
-      rank.ranking.indexOf("upos-sz-mirroraliov.bilivideo.com"), -1);
-    check("the rest of the pool still ranked", rank.ranking.length, 7);
-    check("the rejection is recorded once", rank.rejected.length, 1);
-    check("with its host and status",
-      [rank.rejected[0].host, rank.rejected[0].status],
-      ["upos-sz-mirroraliov.bilivideo.com", 403]);
-    check("a fully accepted round records no rejections",
-      JSON.parse(boot.store[K_RANK]).rejected.length, 0);
-
-    // Total network failure must not wipe a usable ranking.
-    const dead = JSON.stringify({ at: 0, via: "sample", ranking: [TARGET], samples: [] });
-    const broke = await runSurge({
-      script: { type: "cron" },
-      argument: "notify=false",
-      store: { [K_RANK]: dead },
-      http: (opts) => (opts.url.indexOf("bilivideo") !== -1 ? { error: true } : responder(opts))
-    });
-    check("cron finished once when nothing answers", broke.doneCount, 1);
-    check("the previous ranking was kept", JSON.parse(broke.store[K_RANK]).ranking[0], TARGET);
-    check("the previous ranking was not restamped", JSON.parse(broke.store[K_RANK]).at, 0);
-
-    // A renamed or unexpected script type must still probe: appearing installed
-    // while doing nothing is the one failure mode that is invisible to the user.
-    const renamed = await runSurge({
-      script: { type: "panel" },
-      argument: "notify=false",
-      http: (opts) => responder(opts)
-    });
-    checkTrue("an unrecognized script type still probes", renamed.httpCalls.length > 0);
-    checkTrue("it stored a ranking", !!renamed.store[K_RANK]);
-
-    // The http-request role is exercised in the media layer section below.
-
-    const offRun = await runSurge({
-      script: { type: "cron" },
-      argument: "enabled=false",
-      http: () => { throw new Error("a disabled script must not probe"); }
-    });
-    check("a disabled cron finishes", offRun.doneCount, 1);
-    check("a disabled cron makes no requests", offRun.httpCalls.length, 0);
+    // version discipline: desc == script ?v= == script's VERSION
+    checkTrue("the module desc carries the version", MODULE.indexOf("#!desc=v" + api.VERSION) !== -1);
+    const versioned = moduleLines.filter((l) => l.indexOf("script-path=") !== -1);
+    check("every script-path is versioned", versioned.length, 3);
+    checkTrue("every script-path uses the same version",
+      versioned.every((l) => l.indexOf("?v=" + api.VERSION) !== -1));
+    checkTrue("every request script gets the four targets",
+      versioned.every((l) => ["hostOverseaVideo", "hostBStar", "hostPcdn", "hostMcdn"]
+        .every((k) => l.indexOf(k + "={{{" + k + "}}}") !== -1)));
   }
-
-  // ---- report -------------------------------------------------------------
 
   render(true);
   document.title = pass === (pass + failures.length) ? "PASS" : "FAIL";

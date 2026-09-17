@@ -1,286 +1,129 @@
 # BiliFastCDN
 
-Surge iOS 模块：劫持 B 站 `playurl` / 直播 `playinfo` 接口，把视频 CDN 域名重写为**本机实测最快**的节点。
+Surge iOS 模块：把 B 站下发的 CDN 请求换到指定主机。**后端移植自 [Biliverse/Redirect](https://github.com/Biliverse/Redirect)（Apache-2.0）的 Surge 实现**，另加一张状态面板。
 
-给海外用户看冷门视频时用 —— 那些视频常被调度到 PCDN / 家宽节点，跨境拉流会卡；这个模块把它换到官方 CDN 镜像里测速最快的一个。
+给海外用户看冷门视频时用 —— 那些视频常被调度到 PCDN / 家宽节点，跨境拉流会卡；这个模块把它换到官方 CDN 镜像。
 
 ---
 
 ## 声明
 
-**AI Coding。** 本仓库代码由 AI 助手（Qoder）生成，不是人工逐行编写。核心判定逻辑是在阅读参考实现后**逐条移植**的，而不是重新发明：
+**AI Coding。** 本仓库代码由 AI 助手（Qoder）生成，不是人工逐行编写。
 
-- 参考项目：[realzza/bilibili-accelerator](https://github.com/realzza/bilibili-accelerator)（MIT）
-- 参考版本：`bilibili-accelerator.user.js` v0.4.1
-- 移植范围：CDN 主机分类判定、候选节点池、直播 `url_info` 过滤、`backupUrl` 扇出、force / bad-only 语义、`/live-bvc/` 排除规则、明文 http 分片改写
-- 参考 [Biliverse/Redirect](https://github.com/Biliverse/Redirect)（Apache-2.0）两处做法：`binary-body-mode` + gRPC 方法名 pattern 的拦截方式，
-  以及按来源主机名分类的判定条件（`*ov` / `cn-hk-eq-*` → 港澳台，`*bstar1` → 国际版）；
-  **字节级 protobuf 改写器与全部判定实现均为本项目自写，未复制其代码**
-- 完整署名与上游许可全文：[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
-
-**真机验证范围。** 脚本逻辑有 347 项离线断言覆盖（含与上游逐条对照与合成 protobuf fixture）。
-已在真机确认：模块安装、`[Panel]` 段落、分片层能截到明文 http 分片请求、debug 输出落在请求注释里。
-两次真机事故都进了回归测试：
-
-1. 分片层把一条分片的主备候选一起换到排名第一的节点，而该主机名在本地解析到不服务它的边缘
-   （`403 X-Tengine-Error: non-existent domain`）→ 主备全灭、播不了。v0.2.0 起 `smart` 下分片层只修劣质节点。
-2. 分片层把 App 下发的**裸 IP 形式** CDN 地址当 PCDN，换成主机名 → 403。裸 IP 是 App 自己做 HTTPDNS
-   的结果（`203.121.59.225` = akam 边缘、`92.223.116.254` = cosov 边缘），不是 P2P；v0.3.0 起不再动它。
-3. **分片层在健康分片上白跑一趟也是成本**。同一条视频对照抓包：模块关闭时 27 条分片同时在飞、每条 30–55ms；
-   模块开启时单条要 119/343ms，其中 27ms 与 **311ms** 花在我们的脚本里（网络部分都是 10–30ms）。
-   v0.4.0 起分片层的 pattern 收窄到劣质家族，健康分片不再进脚本 —— 收窄后复测：31 条分片全部 206、
-   平均 35ms，脚本调用列表里已经看不到分片层（只剩 3 次 gRPC，174–296ms）。
-
-**gRPC 层真机已确认两件事**：默认引擎确实交付 Uint8Array body；而 App 的 playurl 响应**全是 gzip 帧**
-（实测 5/5，2990B 解压出 12476B message）—— 所以不解压就一次也改不动，`grpcGunzip` 是为此加的开关（默认关，
-原因见「已知限制」）。`gRPC 触发 13 次 / 改写 0 次` 那句老现象到这里就算解释完了。
+- v1.0.0 起：后端是 **Biliverse/Redirect** v0.2.24 的 Surge 实现移植（Apache-2.0），改动清单与许可全文见
+  [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
+- v0.1.0–v0.5.0：移植自 [realzza/bilibili-accelerator](https://github.com/realzza/bilibili-accelerator)（MIT）的测速排名引擎；
+  那段代码已被整体替换，署名作为历史保留
+- 面板是本项目新增的（原实现没有面板）
+- 本仓库自身的代码用 MIT（见 [LICENSE](LICENSE)）
 
 ## 它做什么
 
 ```
-Surge（接口/Grpc 层需要 MitM，分片层不需要）
+Surge（不需要 MitM：App 的分片是明文 http）
         │
-        ├─ gRPC 层   http-response + binary-body-mode：字节级改写 protobuf 里的
-        │            CDN 主机名（官方 App 的 playurl 走这条）
+        ├─ [URL Rewrite]  12 条静态规则：港澳台 *ov / cn-hk-eq-*、Akamai、国际版 *bstar1
+        │                的 upgcxcode 请求直接换 Host —— 在 Surge 重写引擎里执行，不调用脚本
         │
-        ├─ 接口层   http-response：解析 JSON playurl / getRoomPlayInfo，
-        │            改写媒体域名与直播 url_info（网页版走这条）
+        ├─ [Script]       MCDN（换端口 / cdn / sid / 代理包裹）与 PCDN（:4480、:9305）
+        │                这两种形态静态规则表达不了，交给脚本判定
         │
-        ├─ 分片层   http-request：改写明文 http 的分片请求（兜底）
-        │
-        └─ 测速层   cron（默认每 30 分钟检查、结果满 6 小时才重测）：
-                    用真实签名分片做 Range 请求测吞吐，排名写入 $persistentStore
+        └─ [Panel]        状态卡片：生效目标 + 脚本计数
 ```
 
-**为什么需要 gRPC 层**：官方 App 的 playurl 走 `grpc.biliapi.net`（protobuf），JSON 接口层碰不到它。真机 HAR 显示 App 调的是
-`bilibili.app.playerunite.v1.Player/PlayViewUnite` 与 `bilibili.app.playurl.v1.PlayURL/PlayConf`，而它拿到的分片落在
-`upos-hz-mirrorakam.akamaized.net`（Akamai）。
+**为什么把大头交给静态规则**：Surge 每次调用脚本都要重新加载并跑一遍，真机实测一次 20–300ms，而一段视频的分片是几百上千次请求。静态 `[URL Rewrite]` 不产生这种开销，所以常规镜像走规则、只有 MCDN/PCDN 走脚本。
 
-**注意三层的分工**：接口层（JSON）会全量改写 —— 它在响应体里，改完还能补 `backupUrl` 扇出，播放器手里仍有第二、第三条地址。
-gRPC 层（字节层）与分片层在 `smart` 下**只清劣质节点，不碰健康节点**：protobuf 里补不了 `backupUrl`，
-而 `http-request` 拿到的是播放器**已经在用**的那条 URL，换掉之后播放器手上没有第二条地址可退。
-分类固定目标（`hostOversea` 等）由**响应层**执行：网页 JSON 层总会执行，字节层在 `grpcGunzip` 打开时会执行；
-分片层的 pattern 只覆盖劣质家族，健康分片根本不进脚本（原因见下）。
+**MCDN / PCDN 分别怎么处理**（逐条对照 Redirect 的 `Request.mjs`）：
 
-**分片层为什么不放在健康分片上跑**：Surge 调用一次脚本要把脚本重新加载并在 JSE 里跑一遍，
-真机实测**一次 20–300ms**，而一段视频的分片是几百上千次请求。2026-09-18 的对照抓包很直白：
-
-| | 分片请求 | 单条耗时 | 脚本占用 |
-| --- | --- | --- | --- |
-| 模块关闭 | 27 条同时在飞 | 30–55ms | 无 |
-| 模块开启 | 只起了 2 条 | 119 / 343ms | 27ms / **311ms** |
-
-网络那部分在两种情况下都是 10–30ms，多出来的全是脚本的调用成本；健康分片本来一条都不会被改写，
-白交这笔税只会把播放器填缓冲的节奏拖垮。所以现在 **pattern 只拦 mcdn、已知 P2P 域名（`szbdyd.com` /
-`mountaintoys.cn` / `nexusedgeio.com` / `ahdohpiechei.com`）、`upos-sz-mirror14b`、以及带 `os=mcdn` 的 http 地址**。
-想让 `mode=force` / 固定分类目标也改写健康分片，把模块里 `BiliFastCDN-Media` 那条的 pattern 换成：
-
-```
-^http://[a-zA-Z0-9.-]+\.(bilivideo\.(com|cn|net)|akamaized\.net)(:[0-9]+)?/
-```
-
-**分片层的实测教训**：分片 URL 上的 `upsig`/`uparams` 校验对主机名不敏感 —— 把 `upos-hz-mirrorakam.akamaized.net`
-的分片换到 `upos-sz-mirroraliov`，在解析正常的边缘上确实 206 通过（Akamai 的 `hdnts` token 被忽略）。
-但**同一个主机名在不同网络与解析路径下会落到不同边缘**：真机上 `upos-sz-mirroraliov.bilivideo.com` 被解析到一个
-没有该域名的阿里云边缘，每条请求都是 `403 X-Tengine-Error: non-existent domain`。当时一条分片的主备候选
-（akam 与 cosov）都被收敛到了这一个主机名，于是主备一起 403，整集放不出来。这就是分片层不再全量改写的原因。
-
-**裸 IP 不是劣质节点**。App 的 playurl 会下发 IP 形式的 CDN 地址（实测 `203.121.59.225` 是
-`upos-hz-mirrorakam` 的 Akamai 边缘、`92.223.116.254` 是 cosov 的 G-Core 边缘，`os=` 参数分别就是 `akam` / `cosovbv`）——
-那是 App 自己做 HTTPDNS 拿到的结果，不是 P2P。上游把 `ipLike` 当 PCDN 判（浏览器里有 `backup_url` 和卡顿恢复兜底），
-我们照搬过一次，代价是把能用的地址换成了打不开的主机名（403）。**这是与上游有意不同的一处**，离线套件里单独断言。
-
-**视频流不做 MitM。** 分片层处理的是明文 http，gRPC 层与接口层只解密接口响应，都不让 Surge 参与视频流加解密。
-
-**仍未覆盖**：B站的 P2P 通道（`*.solseed.cn` tracker）不是 HTTP，Surge 无法改写。
+| 形态 | 处理 |
+| --- | --- |
+| `*.mcdn.bilivideo.cn` 无端口 | 按路径补端口：`/v1/resource/` → http 8000 / https 8082；`/upgcxcode/` → http 9102 / https 4483 |
+| `*.mcdn.bilivideo.cn:486` | 有 `cdn` 参数 → `d1--<cdn>.bilivideo.com`；有 `sid` → `<sid>.bilivideo.com` |
+| `*:4483` / `*:9102` | 换成 MCDN 代理包裹 `http://proxy-tf-all-ws.bilivideo.com/?url=<原始地址>`；已经是 `.bilivideo.com` 或带 `originalUrl` 的跳过（防回环） |
+| `*:4480`（PCDN） | 回到 `xy_usource` 指向的原节点，没有就落到 `hostPcdn`；协议固定成 http |
+| `*:9305`（PCDN） | 主机名藏在路径第一段里，把它提出来当 Host |
 
 ## 文件
 
 | 文件 | 说明 |
 | --- | --- |
-| `BiliFastCDN.sgmodule` | 模块本体：`[Script]` / `[Panel]` / `[MITM]` / 参数表 |
-| `bili-cdn.js` | 一个文件四种角色：接口改写 / 分片改写 / 测速 / 面板，按运行上下文分派 |
-| `test/verify.html` | 离线验证套件，347 项断言，用浏览器跑 |
-| `LICENSE` | MIT |
-| `THIRD-PARTY-NOTICES.md` | 上游 realzza/bilibili-accelerator 的 MIT 署名 |
+| `BiliFastCDN.sgmodule` | 模块本体：`[General]` / `[URL Rewrite]` / `[Script]` / `[Panel]` / `[MITM]` |
+| `bili-cdn.js` | 请求改写判定（MCDN/PCDN）+ 面板渲染 |
+| `test/verify.html` | 离线验证套件，110 项断言，用浏览器跑 |
+| `LICENSE` | MIT（本仓库自身代码） |
+| `THIRD-PARTY-NOTICES.md` | Redirect 的 Apache-2.0 全文与变更说明 |
 
 ## 配置项
 
-模块参数表里可改（Surge 的模块参数编辑界面）：
+模块参数表里可改：
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
-| `enabled` | `true` | 总开关 |
-| `mode` | `smart` | `smart` 接口层全量改写、gRPC 层与分片层只动劣质节点；`force` 三层都全量改写（分片层全量会让播放器失去主备冗余，慎用）；`bad-only` 只改写 PCDN / 劣质节点；`off` 关闭改写 |
-| `grpcRewrite` | `true` | 是否启用 gRPC（protobuf）响应改写 |
-| `grpcGunzip` | `false` | 是否先解开 gzip 帧再改 gRPC。App 的 playurl 实测全是 gzip 帧，不开则字节层一次也改不动；开启后改写过的帧按未压缩帧发回，客户端不认就会整条 playurl 失败，所以默认关 |
-| `mediaRewrite` | `true` | 是否启用明文 http 分片改写（官方 App 只有这层覆盖得到）。分片层的 pattern 只覆盖劣质家族，健康分片不会调用脚本 |
-| `hostPcdn` / `hostOversea` / `hostBStar` | `auto` | 分类目标覆盖。`auto` = 用测速排名第一；填主机名则固定用它。分类按**来源主机名**判定：`upos-sz-mirror*ov` 与 `cn-hk-eq-*` 属港澳台，`*bstar1` 属国际版，其余按大陆 |
-| `hostAkamai` | `auto` | Akamai 的目标主机。`auto` = **不动 Akamai**；填主机名 = 总是把 Akamai 换到它（等于同时打开 `rewriteAkamai`）。Akamai 在马来西亚这类地区效果差时，填一个测速好的镜像即可 |
-| `rewriteAkamai` | `false` | 是否把 Akamai 换掉（目标看 `hostAkamai`；它是 `auto` 时用测速排名第一）。给 `hostAkamai` 填了主机名就等于打开它 |
-| `hostMcdn` | `proxy-tf-all-ws.bilivideo.com` | MCDN 的目标节点（默认代理包裹，与 realzza、Biliverse/Redirect 两者的默认一致） |
-| `backupFanout` | `true` | 把候选节点写进 `backupUrl`，让播放器自己也能容错切换 |
-| `liveFilter` | `true` | 从直播 `url_info` 中剔除 PCDN 节点 |
-| `notify` | `true` | 测速完成后发通知 |
-| `debug` | `false` | 每次判定写进日志与请求详情注释，且每次改写发一条通知（30 秒内不重复） |
+| `hostOverseaVideo` | `upos-sz-mirrorali.bilivideo.com` | 港澳台（`*ov`、`cn-hk-eq-*`）与 Akamai 分片要换到的主机 |
+| `hostBStar` | `upos-sz-mirrorali.bilivideo.com` | 国际版（`*bstar1`）分片要换到的主机 |
+| `hostPcdn` | `upos-sz-mirrorali.bilivideo.com` | PCDN（`:4480` 没有 `xy_usource` 时）要换到的主机 |
+| `hostMcdn` | `proxy-tf-all-ws.bilivideo.com` | MCDN（`:4483`/`:9102`）的代理包裹目标 |
+| `debug` | `false` | 每次判定写进请求详情注释 |
 
-改 `bili-cdn.js` 顶部常量还能调：候选节点池 `CANDIDATE_POOL`（按自己地区增删）、
-`DEFAULTS` 里的测速有效期 / 样本有效期 / 探测超时与字节数。测速频率改模块里的 `cronexp`。
-`mcdnStrategy`（`proxy` 代理包裹 / `replace` 换 host / `off`）也只在 `DEFAULTS` 里，不在参数表。
+默认值与上游 `database.mjs` 一致。可选主机（上游 `arguments-desc` 列的清单）：
+`upos-sz-mirrorali` / `upos-sz-mirrorcos` / `upos-sz-mirrorhw`（大陆）、
+`upos-sz-mirroraliov` / `upos-sz-mirrorcosov` / `upos-sz-mirrorhwov`（海外）、
+`cn-hk-eq-01-01` … `cn-hk-eq-01-14`（香港 Equinix IX）。
 
-### 发版时版本号要改三处
-
-`bili-cdn.js` 的 `VERSION`、五条 `script-path` 的 `?v=`、模块头部的 `#!desc=`。少改一处就会出现"改了却没生效" ——
-**Surge 对模块文件和远程脚本都会缓存**：
-
-- 远程脚本的缓存由 `script-update-interval` 控制（默认 `86400` = 24 小时，本模块设为 `1800` = 30 分钟）
-- 模块文件本身也会缓存，所以 `#!desc` 带版本号 —— 模块列表里一眼能看出拿到的是哪一版
-- `raw.githubusercontent.com` 自己也有 CDN 缓存，刚 push 完可能取到旧内容（等一两分钟）
-
-判断设备实际加载了哪一版：**模块列表看 `#!desc`，面板标题看 `VERSION`**。排查任何问题前先看这两处。
+**发版时版本号要改两处**：`bili-cdn.js` 的 `VERSION`、模块的 `#!desc` 与三条 `script-path` 的 `?v=`。
+少改一处会出现"改了却没生效" —— Surge 对模块文件与远程脚本都会缓存（远程脚本的缓存由
+`script-update-interval` 控制，本模块设为 30 分钟；模块文件本身也要重新安装/更新一次）。
+排查任何问题前，先比对模块列表的 `#!desc` 与面板标题里的版本号。
 
 ## 怎么确认生效
 
 **看面板。** 策略选择页的「B站CDN」卡片：
 
 ```
-目标 sz-mirroraliov · 72.3 Mbps
-测速 1 分钟前 · 8 个节点 · 剔除 sz-mirrorhwb(500)
-接口 触发12 媒体9 改写27
-gRPC 扫描23 改写21 · 最近 41KB 帧1 改写21
-分片 扫描156 改写0
-分片 smart 只修劣质节点（force 才全量）
-最近 全量改写：sz-mirrorcos → sz-mirroraliov
+静态规则（港澳台/国际版）→ sz-mirrorali
+脚本 MCDN → proxy-tf-all-ws · PCDN → sz-mirrorali
+脚本 命中9 改写4
+最近 MCDN换端口：xy1x2x3x4xy.mcdn.bilivideo.cn → xy1x2x3x4xy.mcdn.bilivideo.cn:9102
 ```
 
-- **「剔除 xxx(状态码)」**：这一轮测速里没应答的候选（`403`/`500`/超时都算）。它们不可能是好目标，
-  所以被剔出排名 —— 写出来是为了让你看到"我原本想用的那个节点，测速时就被否了"。
-- **「分片 smart 只修劣质节点」**：分片层扫描到请求但一条没改写时的说明。这是 `smart` 下的**正常状态**，
-  不是没生效。分片层只修 PCDN / MCDN 这类劣质节点，健康节点原样放过（原因见上）。
+- **第一行**是静态规则的目标。静态重写在 Surge 引擎里执行，**不经过脚本、也不计入下面的计数**；
+  想知道它有没有生效，看请求记录里那条分片请求的 Host 变成了什么。
+- **第二行**是脚本里 MCDN / PCDN 的目标。
+- **计数**只统计落到脚本里的请求。「命中 0」通常意味着没碰到 MCDN/PCDN（正常），
+  而不是模块没工作。
 
-gRPC 那行尾巴是最近一次的**帧结构**，改写为 0 时靠它定位（不必翻日志）：
+**看 debug 输出。** 打开 `debug` 后，脚本的判定会写进**那条请求的「注释」**（Surge 手册：
+`console.log` 输出 "also appears in the request's notes"），不是日志页；导出的 HAR 里就是每个
+entry 的 `comment` 字段。日志页只收 cron/面板这类没有对应请求的脚本输出，且需要
+`[General] loglevel = info`。
 
-| 尾巴里出现 | 含义 |
-| --- | --- |
-| `压缩N` | 有 N 个压缩帧（通常是 gzip）。默认不解压，只能整帧放行；开了 `grpcGunzip` 且改动了就是 `解压N` |
-| `解压N` | N 个压缩帧被解开并改写，且按未压缩帧发回（`grpcGunzip=true` 才会出现） |
-| `非帧` | body 不是 gRPC 帧结构（可能不是本模块该管的响应） |
-| 都没有、且 `改写0` | 真的没有可换的主机名 |
-
-三层计数分开计就是为了定位问题：
-
-| 现象 | 含义 |
-| --- | --- |
-| gRPC 改写 >0 | **gRPC 层生效**（官方 App 的 playurl 走这条，需要 MitM） |
-| gRPC 扫描 >0、改写 0、`压缩N` | 响应是 gzip 帧，字节层解不开 —— 默认配置下 App 的 playurl 就是这个形态，要改写需开 `grpcGunzip` |
-| 分片 改写 >0 | 分片层生效（明文 http 分片，不需要 MitM） |
-| 分片 扫描 >0、改写 0 | `smart` 下的正常状态：分片层只修劣质节点，健康节点放过（卡片会写这行） |
-| 接口 改写 >0 | 接口层生效（网页版 JSON playurl 走这条） |
-| 三层都 0 | 没有任何 B 站流量到达脚本 → 先看面板标题的版本号，再查 MitM |
-| 接口 触发 >0、媒体 0 | 接口被触发了但响应体里没有媒体地址（该接口不是 playurl，或接口报错） |
-| 有流量、改写 0 | 无需改写（`bad-only` 下的正常状态） |
-
-点卡片右上角刷新按钮 = **立即重测**，不用等 30 分钟的定时任务。面板自身刷新（含自动刷新）只读已存结果，不发请求。
-
-**看 debug 输出。** 先看上面的面板 —— 三层计数与 gRPC 帧结构已经在那里，
-最常问的「为什么改写是 0」不用翻日志。要更细的逐条判定，打开 `debug` 后有两处落点：
-
-1. **请求记录的「注释」——HTTP 脚本的输出只在这里**。Surge 手册对 `debug` 的说明是：
-   `console.log()` 输出 "also appears in the request's notes"。所以分片 / gRPC / 接口三条脚本的输出
-   **不在日志页**，要去「请求记录」点开那条请求看注释（导出的 HAR 里就是每个 entry 的 `comment` 字段）。
-2. **日志页**：只有**测速（cron）与面板**这两类脚本没有对应「请求」，它们的输出才落到日志页；
-   日志页还需要 `[General] loglevel = info`（默认 `notify` 会把脚本输出过滤掉，`verbose` 没必要）。
-   想立刻看到，点面板卡片的刷新按钮触发一次测速。
-
-> **`debug` 是有代价的，诊断完请关掉。** 手册写明 `debug` 会 **reload 脚本**（每次执行都重新加载）。
-> 真机实测：打开 debug 后，我们每次脚本调用要 150–350ms（分片层每请求一次、gRPC 层每次 playurl 一次），
-> 关掉后这一项成本消失。它只是诊断开关，不是常开开关 —— 常开时在高分片数的视频上会明显拖慢整机网络处理。
-> 另外 Surge 会把过长的日志行**掐掉尾巴**（实测 `compresse<...14...>`，正好把计数掐掉），
-> 所以模块的判定行都写得很短、不重复主机名与 URL，计数放在前面。
-
-真机日志里长这样（注释字段原文，一次会话里同时能看到三层）：
-
-```
-[BiliFastCDN] grpc: bytes=3026 frames=1 compressed=1 rewrites=0
-[BiliFastCDN] response: bytes=41337 signal=true code=0 rewrites=2 {"force-host":1} target=upos-tf-all-hw.bilivideo.com
-[BiliFastCDN]   force-host upos-sz-mirrorcos.bilivideo.com -> upos-tf-all-hw.bilivideo.com
-[BiliFastCDN] request: pcdn-host upos-sz-mirror14b.bilivideo.com -> upos-tf-all-hw.bilivideo.com
-[BiliFastCDN] probe: upos-tf-all-hw.bilivideo.com status=200 251ms 33.42Mbps
-```
-
-三种要会看的形态：
-
-- `compressed=1 rewrites=0`：响应是 gzip 帧。默认配置下 App 的 playurl 永远停在这里；开了 `grpcGunzip` 后会多出
-  `unzipped=N`（= 解开并改写了几帧）。
-- `pcdn-host <主机名> -> …`：劣质节点被换掉。**注意原始主机是域名**；v0.2.0 的一次事故里这里是裸 IP
-  （App 的 HTTPDNS 结果，被当成 PCDN），v0.3.0 起裸 IP 不再改写。
-- `signal=false`：「脚本跑到了，但响应体里没有媒体地址」。
-
-日志里只有域名、没有签名 query（`sign` / `deadline` / `oi` 一律不落盘），可以安全贴出来求助。
+> **`debug` 不是常开开关。** 手册写明它会 reload 脚本（每次执行重新加载），实测每次调用
+> 150–350ms。诊断完请关掉。
 
 ## 与原项目的差异
 
-| 方面 | bilibili-accelerator | 本项目 |
+| 方面 | Redirect | 本项目 |
 | --- | --- | --- |
-| 运行环境 | 浏览器 userscript | Surge iOS 模块 |
-| 拦截点 | 页面 `fetch` / `XHR` / `JSON.parse` | API 响应体改写 + 明文 http 分片改写 |
-| 测速时机 | 播放时实时探测 | cron 后台任务 + 面板手动触发 |
-| 测速请求 | `fetch`，读满 768KB 后中断 | `$httpClient` + `Range`，恰好 1MB |
-| 界面 | 页面浮层面板、速度曲线 | Surge 信息面板（无曲线） |
-| 裸 IP 地址 | 当 PCDN 节点改写 | **不动它**（App 的 HTTPDNS 结果，改了会 403；浏览器侧有 backup/恢复兜底，Surge 侧没有） |
-| 未移植 | — | 速度曲线、沉浸模式 CSS、P2P Guard（WebRTC，Surge 侧无对应手段）、配置桥 |
-
-必须改的原因：Surge 不允许在 http-request 里做异步，也无法用 `fetch` / `ReadableStream`；
-把 playurl 响应阻塞几秒比"排名晚几小时"更糟，所以测速被拆到 cron。
+| 客户端 | Surge / Loon / Stash / Shadowrocket（handlebars 模板 + rollup 构建） | 只做 Surge 版 |
+| 配置 | `$argument` + BoxJs（`PersistentStore`）双通道，可切 `Storage` 模式 | 只用 Surge 模块参数表 |
+| 设置界面 | 另配 PreferencePanes / BoxJs 前端 | 无，参数表 + 状态面板 |
+| 请求脚本覆盖面 | 含一条 `^https?://.+\.bilivideo\.com/upgcxcode/` 的宽 pattern（所有镜像都进脚本） | **只让 MCDN/PCDN 进脚本**：常规镜像由静态规则处理，省掉每条分片的脚本开销 |
+| 面板 | 无 | 有 |
 
 ## 已知限制
 
-- **官方 App 的 playurl 是 gRPC**（`grpc.biliapi.net`，protobuf）。gRPC 层在**字节层**处理它：不解析 schema，
-  递归走一遍 protobuf 结构，把 length-delimited 字段里的 CDN 主机名换掉并同步修正长度前缀。
-  安全性质是「没有可换的主机名时输出与输入逐字节相同」，替换后还会重新校验一次能否解析，失败就整段放弃。
-- **gRPC 的 body 是帧序列，不是裸 protobuf**：每帧 `1 字节压缩标志 + 4 字节大端长度 + 消息`。
-  必须按帧解析 —— 把整段当裸 message 的话第一字节（标志位）就会被判为非法 tag，一次都改不成（这个坑真机踩过：
-  `gRPC 触发 13 次 / 改写 0 次`）。
-- **gRPC 层的三个边界**：
-  ① 压缩帧（标志位非 0）：**实测 App 的 playurl 响应 100% 是这种**（5/5，2990B gzip → 12476B message）。
-  默认只能整帧放行，面板显示 `压缩N`；打开 `grpcGunzip` 后会用 `$utils.ungzip` 解开、改写，再把这一帧
-  按**未压缩帧**（flag=0）发回 —— gRPC 的压缩标志是逐帧的，客户端两种都该收，但万一某个客户端不认，
-  整条 playurl 会失败，所以这个开关默认关。Surge 只有 `ungzip`、没有 `gzip`，压不回去；
-  ② 模块里那条 `max-size` 是缓冲上限，超过就整条跳过直接放行（iOS 上过大会占 NE 进程内存），默认 1MB 偏小，本模块设为 4MB；
-  ③ 主机名锚点覆盖 `bilivideo.{com,cn,net}` / `akamaized.net` / 已知 PCDN 家族（`szbdyd.com`、`mountaintoys.cn` 等），
-  **裸 IP 形式的地址不会被动**（见上：那是 App 的 HTTPDNS 结果，改成主机名会 403）。
-- **gRPC 的 pattern 是按方法名收窄的**（`PlayViewUnite` / `PlayView` / `PlayConf` / `PlayURL`）。判定按 body 内容做、
-  不按方法名写死，所以 B 站以后再把别的接口迁到 gRPC 时，只需把新方法名加进模块那条 pattern 即可。
-- **两条 pattern 不能重叠**：Surge 每个请求只跑第一条匹配的脚本。JSON 那条的 pattern 必须只写 JSON 端点路径
-  （`/x/player/*/playurl`、`/pgc/player/*/playurl`、`getRoomPlayInfo`）—— 早期写成 `.*(playurl|...)` 会误匹配
-  gRPC 服务名里的 `playurl`，把 protobuf 响应交给按 JSON 处理的脚本。
-- **JSC 引擎下缓冲 gRPC body 会占 NE 进程内存**。官方文档明确说 JSC 在 NE 进程内运行、内存占用显著上升，
-  可能被系统终止；这也是 Redirect 给这几个条目加 `engine=webview` 的原因（WebView 在独立进程 + 可 JIT）。
-  本模块目前用默认引擎并把 `max-size` 限到 4MB；如果观察到卡顿或 NE 内存告警，把 gRPC 条目的 `engine` 改成 `webview`
-  是官方推荐的缓解手段（它只是脚本引擎，不是设置界面）。
-- **分片层没有 backupUrl 兜底，全量改写会拆掉播放器的主备冗余**。接口层改写失败时播放器还能靠 `backupUrl` 换节点；
-  分片层是逐个请求改写，而且改的就是播放器正在用的那条 URL。真机踩过：一条分片的主备候选被一起收敛到同一个主机名，
-  而那个主机名在本地被解析到一个不服务该域名的阿里云边缘（`403 X-Tengine-Error: non-existent domain`），
-  主备一起失败，视频直接放不出来（不是卡顿，是播不了）。所以 v0.2.0 起 `smart` 下分片层只修劣质节点，
-  v0.4.0 起连 pattern 都收窄到劣质家族 —— 健康分片不进脚本，也就没有"白跑一趟"的调用成本。出问题也可以单独关 `mediaRewrite`。
-- **分片层的 pattern 收窄是有代价的**：`mode=force` 与分类固定目标（`hostOversea` 等）不再作用于健康分片
-  （它们仍作用于接口层与字节层）。要恢复"健康分片也改写"，按上面「注意三层的分工」里给出的那条 pattern 替换即可。
-- **测速排名只代表"测速那一刻、那条 DNS 解析路径"**。`-ov` 这类出海镜像的主机名在不同网络、不同解析器下会落到
-  不同边缘，同一个主机名可以一边 206 一边 403（原因见上一条）。所以测速被否掉的候选会记进排名并在面板上显示，
-  而分片层不再把全部流量押在排名第一上。
-- **多连接聚合（IDM 那种）做不到**。Surge 脚本能做的只有改写请求的 URL，没法把一条客户端请求拆成多条 Range
-  并发再合并回同一个响应 —— 那需要下载器/代理层面的支持，不是一个模块能提供的。播放器自己已经在并发拉分片
-  （真机抓包里同一瞬间 27 条分片在飞），所以"聚合网速"这件事本来就在客户端完成，我们能改的只有**用哪个主机**。
-- **换掉 Akamai 要动的是 URL 里的主机名，不是把域名拉黑**。`hostAkamai` 填一个镜像（或打开 `rewriteAkamai`
-  用测速第一）之后，App 的 playurl 响应里 `*.akamaized.net` 的地址会当场被换掉（需要 `grpcGunzip=true`，
-  否则 gzip 帧改不动）；网页版走接口层，不需要额外开关。用 `RULE ... REJECT` 直接拉黑 akam 不在本模块范围内，
-  而且播放器不一定会在连接被拒后切到备选地址。
-- **直播**（`/live-bvc/`）只做 PCDN 剔除，不做域名替换 —— 那是另一套 CDN 层级，换域名会直接把直播打死。
-- **`debug` 不是常开开关**。手册写明它会 reload 脚本（每次执行重新加载），真机实测打开后我们每次调用要
-  150–350ms；分片层是按请求调用的，一段视频就是几百上千次。诊断完请关掉 —— 常开时它会拖慢整机而不只是本模块。
-- **MitM 会解密 `api.bilibili.com`**。若某客户端做了证书校验（出现接口报错、登录异常），把 `[MITM]` 里对应域名去掉即可；模块本身不会失效，只是那些接口不再被改写。
-- **签名分片 URL 会过期**。测速样本过期时该轮会退回纯延迟排序（面板会标注"仅延迟测速"）。
-- **面板** 依赖 `[Panel]` 段落被 Surge 接受。若卡片一直显示静态文案「点刷新按钮测速」，说明没生效，此时用计数与 `debug` 输出判断。
+- **静态规则只覆盖 `upgcxcode` 路径**。上游如此：`/v1/resource/` 与其它路径不在规则里，MCDN 的
+  `/v1/resource/` 只补端口不换主机。
+- **不在名单里的主机不会被改**：`upos-sz-mirror14b` 之类的 PCDN 家族、以及客户端自己 HTTPDNS 得到的
+  裸 IP 地址，规则与脚本都不动它们（上游同样如此）。裸 IP 形式在真机上出现过，换成主机名后
+  曾因本地解析到不服务该域名的边缘而 403。
+- **换到别的主机等于放弃了播放器自己的备选**：B 站的 playurl 会给主备两个候选，把其中一个换走之后，
+  剩下那个就是唯一来源。上游的静态目标是**固定主机**，本项目保持同样的语义。
+- **`[MITM]` 只在你要改写 HTTPS 分片时才需要**。官方 App 的分片是明文 http，不需要 MitM；
+  但 HTTPS 的请求不解密就看不见，也就无法重写。
+- **多连接聚合（IDM 那种）做不到**：Surge 脚本只能改写请求 URL，没法把一条客户端请求拆成多条 Range
+  并发再合并。播放器本来就在并发拉分片。
+- **面板只统计脚本**：静态规则命中多少条无法计数（它们不经过脚本），别把「命中 0」当成没生效。
 
 ## 测试
 
@@ -289,26 +132,19 @@ chrome --headless=new --disable-gpu --allow-file-access-from-files \
        --virtual-time-budget=20000 --dump-dom test/verify.html
 ```
 
-输出 `ALL n CHECKS PASSED` 或失败明细。覆盖内容：
+输出 `ALL n CHECKS PASSED` 或失败明细。110 项断言覆盖：
 
-- **与上游对照**：18 个 URL 的 `classify` 判定与 `rewriteUrlDetail` 改写结果逐条比对（17 条要求一致，
-  裸 IP 那条是**有意偏离**，单独断言：上游判 PCDN、我们不判）；把 `bilibili-accelerator.user.js` 放到
-  `test/fixtures/` 下即可启用，未放则跳过并标注
-- 五个角色的端到端模拟：接口改写（force / bad-only / 关闭 / 直播 / 空载荷）、gRPC 改写、分片改写、测速（首次引导、样本过期回退、全部失败、结果缓存命中）、面板
-- 分片层策略：`smart` 下健康节点原样放过、一条分片的主备候选都保持原生、`force` 才全量改写、分类固定目标在 `smart` 下照办（这几条是对"主备一起 403 导致播不了"的回归）
-- **分片层 pattern 的意图**：8 条劣质家族 URL 必须命中、5 条健康/裸 IP/https URL 必须放过 —— pattern 与模块里那条保持一致，改一边就要改另一边
-- 裸 IP 回归：分片层与字节层都不动 IP 形式的 CDN 地址（对"把 IP 当 PCDN 换掉导致 403"的回归）
-- gRPC gzip：默认不解压（整帧放行并计数）、`grpcGunzip` 开启后解压→改写→按未压缩帧发回、
-  解压失败 / `$utils` 缺失 / 返回值不是 message 三种情况都原样保留
-- 测速剔除留痕：403 的候选进不了排名、记进排名的 `rejected`、面板「剔除」尾巴能显示出主机名与状态码
-- 签名 query 必须逐字节保留；分片改写必须保持原 scheme；日志不得出现 token
-- 改写幂等（Surge 会对改写后的 URL 重跑脚本）
-- protobuf 改写：等长替换不改动任何长度前缀、变长替换（32→33）精确修正嵌套长度、改写后可重新解析出同样的结构、
-  无可换主机／非 protobuf 三种情况一律逐字节原样放行
-- gRPC 帧：单帧／多帧都能改写、帧长度按新消息长度重算、压缩帧原样保留并计数、
-  截断的帧流不动、**裸 message 不会被误当成帧流**（这条是对真机 `13 次触发 0 次改写` 的回归）
-- `$httpClient` 超时必须是秒级（Surge 该 API 的单位是秒，写毫秒会静默挂死 cron）
+- URL 原语与参数解析（含 `xy_usource` 的百分号解码）
+- 配置：上游默认值、参数覆盖、snake_case 别名、粘贴整条 URL 时只取主机名、占位符未替换时回落默认值
+- 主机名分类：固定名单 + `*ov` / `cn-hk-eq-*` / `*bstar1` 通配，大陆镜像一律不动
+- MCDN / PCDN 端口矩阵：无端口补端口、`:486` 的 `cdn`/`sid`、`:4483`/`:9102` 的代理包裹与两种回环跳过、
+  `:4480` 的 `xy_usource`、`:9305` 的路径内主机
+- 请求角色：改写结果、签名 query 逐字节保留、计数、debug 行长度与不落签名
+- 面板角色：目标与计数展示、样式、不发任何请求（`$httpClient` 一旦被调用即失败）
+- **模块文件与脚本的一致性**：12 条静态规则、`force-http-engine-hosts` 的端口、只有两条请求脚本、
+  面板挂载、版本号三处一致、旧引擎的参数已清干净
 
 ## 许可证
 
-本项目是 MIT 代码的衍生作品，上游署名与许可全文必须保留 —— 见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
+本仓库自身代码：MIT（[LICENSE](LICENSE)）。移植部分的许可是 Apache-2.0，全文与变更说明见
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
