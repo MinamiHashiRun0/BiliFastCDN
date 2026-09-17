@@ -2,6 +2,10 @@
 
 本项目的核心判定逻辑移植自 **bilibili-accelerator**（MIT 许可）。
 
+另外参考了 **Biliverse/Redirect**（Apache-2.0）的 gRPC 拦截思路 —— 具体为「用 `binary-body-mode` 拿到 Uint8Array
+body，并按 gRPC 方法名写 pattern」这一做法。**未复制其代码**：字节级 protobuf 改写器（递归走 message 结构、
+替换 length-delimited 字段里的主机名并修正长度前缀）为本项目自行实现。此致谢不构成许可义务，仅作来源说明。
+
 ---
 
 ## bilibili-accelerator

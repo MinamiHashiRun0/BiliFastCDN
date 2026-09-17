@@ -695,7 +695,154 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
       [counted.last.from, counted.last.to], ["upos-hz-mirrorakam.akamaized.net", TARGET]);
   }
 
-  // ---- 10. panel role -----------------------------------------------------
+  // ---- 10. gRPC / protobuf layer ------------------------------------------
+
+  section("gRPC protobuf layer");
+  {
+    // Minimal protobuf codec, used both to build fixtures and to verify that the
+    // rewritten body still parses back to the same structure.
+    const vint = (n) => { const o = []; let v = n; do { const b = v % 128; v = Math.floor(v / 128); o.push(v > 0 ? b + 128 : b); } while (v > 0); return o; };
+    const asc = (s) => Array.from(s).map((c) => c.charCodeAt(0));
+    const ldf = (no, payload) => vint((no << 3) | 2).concat(vint(payload.length), payload);
+    const sfield = (no, s) => ldf(no, asc(s));
+    const readVint = (buf, pos) => {
+      let v = 0, sh = 0;
+      while (pos < buf.length) {
+        const b = buf[pos++];
+        v += (b & 127) * Math.pow(2, sh);
+        if (!(b & 128)) return { value: v, next: pos };
+        sh += 7;
+      }
+      return null;
+    };
+    function collect(buf, start, end, out, depth) {
+      let pos = start;
+      while (pos < end) {
+        const tag = readVint(buf, pos);
+        if (!tag) return false;
+        pos = tag.next;
+        const wire = tag.value & 7;
+        if (wire === 0) { const v = readVint(buf, pos); if (!v) return false; pos = v.next; }
+        else if (wire === 1) pos += 8;
+        else if (wire === 5) pos += 4;
+        else if (wire === 2) {
+          const len = readVint(buf, pos);
+          if (!len) return false;
+          const ps = len.next, pe = ps + len.value;
+          if (pe > end) return false;
+          const sub = [];
+          if (depth < 12 && collect(buf, ps, pe, sub, depth + 1)) out.push(...sub);
+          else out.push(String.fromCharCode.apply(null, Array.from(buf.slice(ps, pe))));
+          pos = pe;
+        } else return false;
+      }
+      return pos === end;
+    }
+    const stringsOf = (buf) => { const out = []; collect(buf, 0, buf.length, out, 0); return out; };
+    const hasBytes = (buf, s) => {
+      const n = asc(s);
+      outer: for (let i = 0; i + n.length <= buf.length; i++) {
+        for (let k = 0; k < n.length; k++) if (buf[i + k] !== n[k]) continue outer;
+        return true;
+      }
+      return false;
+    };
+
+    const AKAM = "upos-hz-mirrorakam.akamaized.net";        // 32 字符
+    const COSOV = "upos-sz-mirrorcosov.bilivideo.com";      // 33 字符，与 aliov 等长
+    const ALIOV = "upos-sz-mirroraliov.bilivideo.com";
+    const urlOf = (h) => "http://" + h + "/upgcxcode/1/2/3.m4s?deadline=1&upsig=abc";
+    const mkBody = (host) => new Uint8Array([].concat(
+      sfield(1, "playurl-id"),
+      ldf(2, [].concat(sfield(1, urlOf(host)), sfield(3, "backup"))),
+      sfield(4, "tail")
+    ));
+    const fresh = () => ({ count: 0, reasons: {}, details: [], grpcRewrites: 0 });
+    const cfg = Object.assign({}, api.DEFAULTS, { mode: "smart" });
+    const ranked = { ranking: [ALIOV] };
+    const cold = null;
+
+    // Equal-length swap: only the host bytes change, every length prefix stays put.
+    const eq = api.rewriteProto(mkBody(COSOV), cfg, ranked, fresh());
+    const eqStats = fresh();
+    const eq2 = api.rewriteProto(mkBody(COSOV), cfg, ranked, eqStats);
+    check("equal-length swap rewrites exactly one host", eqStats.grpcRewrites, 1);
+    check("equal-length swap keeps the body size", eq2.length, mkBody(COSOV).length);
+    check("the rewritten body parses back with the new host",
+      stringsOf(eq2), ["playurl-id", urlOf(ALIOV), "backup", "tail"]);
+
+    // Unequal swap: the host grows by one byte, so the enclosing length prefixes
+    // (both the nested message and the string field) must be rewritten too.
+    const src = mkBody(AKAM);
+    const st = fresh();
+    const out = api.rewriteProto(src, cfg, ranked, st);
+    check("unequal-length swap grows by exactly the host delta",
+      out.length - src.length, ALIOV.length - AKAM.length);
+    check("the resized body still parses back",
+      stringsOf(out), ["playurl-id", urlOf(ALIOV), "backup", "tail"]);
+
+    // Identity preservation is the safety property: nothing swappable means the
+    // original bytes must be returned untouched (null, i.e. passthrough).
+    check("a body whose only host is already the target is untouched",
+      api.rewriteProto(mkBody(ALIOV), cfg, ranked, fresh()), null);
+    check("a body with no CDN host is untouched",
+      api.rewriteProto(new Uint8Array([].concat(sfield(1, "x"), sfield(2, "https://i0.hdslb.com/bfs/a.jpg"))),
+        cfg, ranked, fresh()), null);
+    check("a body that is not protobuf is untouched",
+      api.rewriteProto(new Uint8Array([].concat([7, 7, 7], asc(urlOf(AKAM)), [255])), cfg, ranked, fresh()), null);
+
+    // Policy mirrors the other layers: akamai only moves once something was measured.
+    check("akamai is left alone before the first measurement",
+      api.rewriteProto(mkBody(AKAM), cfg, cold, fresh()), null);
+    checkTrue("akamai moves once ranked",
+      api.rewriteProto(mkBody(AKAM), cfg, ranked, fresh()) !== null);
+    checkTrue("an mcdn host moves even without a ranking",
+      api.rewriteProto(mkBody("xy1x2x3x4xy.mcdn.bilivideo.cn"), cfg, cold, fresh()) !== null);
+
+    // Several URLs in one message all get rewritten.
+    const multi = new Uint8Array([].concat(sfield(1, urlOf(COSOV)), sfield(2, urlOf(COSOV))));
+    const mst = fresh();
+    api.rewriteProto(multi, cfg, ranked, mst);
+    check("every occurrence in the message is swapped", mst.grpcRewrites, 2);
+
+    // End to end: a binary body must take the gRPC path and come back as bytes.
+    const run = await runSurge({
+      script: { type: "http-response" },
+      request: { url: "https://grpc.biliapi.net/bilibili.app.playerunite.v1.Player/PlayViewUnite" },
+      response: { status: 200, headers: {}, body: mkBody(COSOV) },
+      argument: "mode=smart",
+      store: { [K_RANK]: JSON.stringify({ at: clock.now, via: "sample", ranking: [ALIOV], samples: [] }) }
+    });
+    checkTrue("a binary body comes back rewritten", hasBytes(run.donePayload.body, urlOf(ALIOV)));
+    check("the gRPC call is counted", JSON.parse(run.store[K_STATS]).grpcCalls, 1);
+    check("the gRPC rewrite is counted", JSON.parse(run.store[K_STATS]).grpcRewrites, 1);
+    check("the gRPC layer leaves the payload counters alone", JSON.parse(run.store[K_STATS]).calls, 0);
+
+    const runOff = await runSurge({
+      script: { type: "http-response" },
+      request: { url: "https://grpc.biliapi.net/bilibili.app.playurl.v1.PlayURL/PlayConf" },
+      response: { status: 200, headers: {}, body: mkBody(COSOV) },
+      argument: "mode=smart&grpcRewrite=false",
+      store: { [K_RANK]: JSON.stringify({ at: clock.now, via: "sample", ranking: [ALIOV], samples: [] }) }
+    });
+    check("grpcRewrite=false leaves the body alone", runOff.donePayload, {});
+    check("but the gRPC call is still counted", JSON.parse(runOff.store[K_STATS]).grpcCalls, 1);
+
+    // A gzipped message cannot be recompressed here, so it must be skipped loudly.
+    const gz = new Uint8Array([].concat([31, 139, 8, 0], asc(urlOf(COSOV))));
+    const runGz = await runSurge({
+      script: { type: "http-response" },
+      request: { url: "https://grpc.biliapi.net/bilibili.app.playerunite.v1.Player/PlayViewUnite" },
+      response: { status: 200, headers: {}, body: gz },
+      argument: "mode=smart&debug=true",
+      store: { [K_RANK]: JSON.stringify({ at: clock.now, via: "sample", ranking: [ALIOV], samples: [] }) }
+    });
+    check("a gzipped gRPC body passes through", runGz.donePayload, {});
+    checkTrue("and the skip is logged",
+      runGz.logs.some((l) => l.indexOf("gzip-skip") !== -1));
+  }
+
+  // ---- 11. panel role -----------------------------------------------------
 
   section("panel role");
   {
@@ -747,7 +894,8 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
       argument: "mode=smart&notify=false",
       store: Object.assign({}, rankStore, {
         [K_STATS]: JSON.stringify({
-          calls: 12, signals: 9, rewrites: 27, liveDropped: 3, mediaCalls: 156, mediaRewrites: 150,
+          calls: 12, signals: 9, rewrites: 27, liveDropped: 3, grpcCalls: 23, grpcRewrites: 21,
+          mediaCalls: 156, mediaRewrites: 150,
           last: { reason: "force-host", from: "upos-sz-mirrorcos.bilivideo.com", to: TARGET, at: clock.now },
           lastNotifyAt: 0
         })
@@ -756,11 +904,13 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     });
     check("style is good once rewrites happen", reported.donePayload.style, "good");
     checkTrue("it shows the payload layer counters",
-      reported.donePayload.content.indexOf("接口 触发 12 · 媒体 9 · 改写 27") !== -1);
+      reported.donePayload.content.indexOf("接口 触发12 媒体9 改写27") !== -1);
+    checkTrue("it shows the gRPC layer counters separately",
+      reported.donePayload.content.indexOf("gRPC 扫描23 改写21") !== -1);
     checkTrue("it shows the media layer counters separately",
-      reported.donePayload.content.indexOf("分片 156 次 · 改写 150 处") !== -1);
+      reported.donePayload.content.indexOf("分片 扫描156 改写150") !== -1);
     checkTrue("it shows the last move", reported.donePayload.content.indexOf("最近 全量改写：sz-mirrorcos → tf-all-hw") !== -1);
-    checkTrue("it shows the live filtering", reported.donePayload.content.indexOf("直播剔除 3") !== -1);
+    checkTrue("it shows the live filtering", reported.donePayload.content.indexOf("直播剔除3") !== -1);
     check("no requests when only reporting", reported.httpCalls.length, 0);
 
     // Traffic that needed no rewrite is a different situation from no traffic.
