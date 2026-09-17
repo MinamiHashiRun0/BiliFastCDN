@@ -747,6 +747,35 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     check("category: a plain mirror is pcdn",
       api.categoryOf("upos-sz-mirrorcos.bilivideo.com"), "pcdn");
 
+    // 分片层的 pattern 只覆盖劣质家族：Surge 每次调用脚本都要重新加载并跑一遍那个 JS VM
+    // （真机实测一次 20–300ms），而分片是一段视频几百上千次请求 —— 让健康分片白交这笔税
+    // 会把播放器填缓冲的节奏拖垮。这条与模块里的 pattern 保持一致，改一边就要改另一边。
+    const MEDIA_PATTERN = new RegExp("^http://(xy(\\d+x){3}\\d+xy\\.mcdn\\.bilivideo\\.(cn|com|net)" +
+      "|upos-sz-mirror14b\\.bilivideo\\.com" +
+      "|[a-zA-Z0-9.-]+\\.(szbdyd\\.com|mountaintoys\\.cn|nexusedgeio\\.com|ahdohpiechei\\.com))[:/]" +
+      "|^http://.*[?&]os=mcdn(&|$)");
+    const MUST_MATCH = [
+      "http://xy1x2x3x4xy.mcdn.bilivideo.cn:486/v1/resource/3-1-30280.m4s?os=mcdn&deadline=1",
+      "http://xy1x2x3x4xy.mcdn.bilivideo.com/v1/resource/3.m4s?deadline=1",
+      "http://upos-sz-mirror14b.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1",
+      "http://foo.szbdyd.com/upgcxcode/1/2/3.m4s?xy_usource=upos-sz-mirrorhw.bilivideo.com",
+      "http://edge.node.mountaintoys.cn/upgcxcode/1/2/3.m4s",
+      "http://node.nexusedgeio.com/upgcxcode/1/2/3.m4s",
+      "http://node.ahdohpiechei.com/upgcxcode/1/2/3.m4s",
+      "http://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&os=mcdn"
+    ];
+    const MUST_NOT_MATCH = [
+      "http://upos-hz-mirrorakam.akamaized.net/upgcxcode/1/2/3.m4s?deadline=1&os=akam",
+      "http://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&os=cosovbv",
+      "http://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&os=cosbv",
+      "http://203.121.59.225/upgcxcode/1/2/3.m4s?deadline=1&os=akam",
+      "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/1/2/3.m4s?deadline=1"
+    ];
+    MUST_MATCH.forEach((u) => checkTrue("the segment pattern still intercepts " + u.slice(0, 46),
+      MEDIA_PATTERN.test(u)));
+    MUST_NOT_MATCH.forEach((u) => checkTrue("the segment pattern skips healthy segment " + u.slice(0, 46),
+      !MEDIA_PATTERN.test(u)));
+
     const OV = "http://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&sign=abc";
     const ovAuto = await asRequest(OV, "mode=smart", Object.assign({}, rankStore));
     check("smart mode leaves a healthy oversea host alone too", ovAuto.donePayload, {});
