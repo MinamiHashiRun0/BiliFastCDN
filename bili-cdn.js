@@ -11,7 +11,7 @@
   var K_STATS = "bili_fast_cdn.stats.v1";
 
   // Surge 对远程脚本默认缓存 86400 秒，面板标题带版本号才能确认设备上跑的是哪一版。
-  var VERSION = "0.1.3";
+  var VERSION = "0.1.4";
   var PANEL_TITLE = "B站CDN";
   var REASON_LABELS = {
     "force-host": "全量改写",
@@ -19,7 +19,8 @@
     "mcdn-host": "MCDN替换",
     "mcdn-proxy": "MCDN代理",
     "scheduler": "调度器回源",
-    "akamai-host": "Akamai替换"
+    "akamai-host": "Akamai替换",
+    "grpc-host": "gRPC替换"
   };
   // 一次 playurl 响应会改写多个 URL，调试通知必须限流，不能按响应逐条发。
   var DEBUG_NOTIFY_MS = 30000;
@@ -50,9 +51,10 @@
     portHeuristic: true,
     notify: true,
     debug: false,
-    // 明文 HTTP 的分片请求改写（无需 MitM）。App 的 playurl 走 gRPC，payload 改写
-    // 碰不到它，而它的分片是 http，所以这一层才是 App 生效的那一半。
+    // 明文 HTTP 的分片请求改写（无需 MitM）。
     mediaRewrite: true,
+    // gRPC（protobuf）响应改写：App 的 playurl 走这里。
+    grpcRewrite: true,
     rankTtlMs: 6 * 60 * 60 * 1000,
     sampleTtlMs: 90 * 60 * 1000,
     // 注意单位：Surge $httpClient 的 timeout 是秒，本文件其余 TTL 是毫秒。
@@ -63,6 +65,7 @@
   var CFG_ALIASES = {
     backup_fanout: "backupFanout",
     media_rewrite: "mediaRewrite",
+    grpc_rewrite: "grpcRewrite",
     live_filter: "liveFilter",
     mcdn_strategy: "mcdnStrategy",
     port_heuristic: "portHeuristic",
@@ -167,6 +170,7 @@
     cfg.liveFilter = asBool(cfg.liveFilter, DEFAULTS.liveFilter);
     cfg.backupFanout = asBool(cfg.backupFanout, DEFAULTS.backupFanout);
     cfg.mediaRewrite = asBool(cfg.mediaRewrite, DEFAULTS.mediaRewrite);
+    cfg.grpcRewrite = asBool(cfg.grpcRewrite, DEFAULTS.grpcRewrite);
     cfg.rewriteAkamai = asBool(cfg.rewriteAkamai, DEFAULTS.rewriteAkamai);
     cfg.portHeuristic = asBool(cfg.portHeuristic, DEFAULTS.portHeuristic);
     cfg.rankTtlMs = asNumber(cfg.rankTtlMs, DEFAULTS.rankTtlMs);
@@ -586,6 +590,7 @@
   function emptyStats() {
     return {
       calls: 0, signals: 0, rewrites: 0, liveDropped: 0,
+      grpcCalls: 0, grpcRewrites: 0,
       mediaCalls: 0, mediaRewrites: 0, last: null, lastNotifyAt: 0
     };
   }
@@ -606,10 +611,16 @@
   // 只有第一个才是 MitM 没生效。
   function recordResponse(cfg, stats, isLive, rank) {
     var state = loadStats();
-    state.calls += 1;
-    if (stats.signal) state.signals += 1;
-    state.rewrites += stats.count;
-    if (isLive) state.liveDropped += stats.count;
+    if (stats.binary) {
+      // gRPC 层单独计数：它和 JSON 层的失败模式完全不同（引擎能力 / 二进制 body）
+      state.grpcCalls += 1;
+      state.grpcRewrites += stats.grpcRewrites;
+    } else {
+      state.calls += 1;
+      if (stats.signal) state.signals += 1;
+      state.rewrites += stats.count;
+      if (isLive) state.liveDropped += stats.count;
+    }
     if (stats.details.length) {
       var last = stats.details[stats.details.length - 1];
       state.last = { reason: last.reason, from: last.from, to: last.to, at: Date.now() };
@@ -874,9 +885,10 @@
       lines.push(note ? note : "点刷新按钮立即测速");
     }
 
-    lines.push("接口 触发 " + state.calls + " · 媒体 " + state.signals + " · 改写 " + state.rewrites);
-    lines.push("分片 " + state.mediaCalls + " 次 · 改写 " + state.mediaRewrites + " 处" +
-      (state.liveDropped ? " · 直播剔除 " + state.liveDropped : ""));
+    lines.push("接口 触发" + state.calls + " 媒体" + state.signals + " 改写" + state.rewrites);
+    lines.push("gRPC 扫描" + state.grpcCalls + " 改写" + state.grpcRewrites);
+    lines.push("分片 扫描" + state.mediaCalls + " 改写" + state.mediaRewrites +
+      (state.liveDropped ? " 直播剔除" + state.liveDropped : ""));
     if (state.last) {
       lines.push("最近 " + reasonLabel(state.last.reason) + "：" +
         shorten(state.last.from) + " → " + shorten(state.last.to));
@@ -884,8 +896,10 @@
 
     // 接口层要 MitM 才看得到（网页版 playurl）；分片层看的是明文 http，不需要 MitM，
     // App 只有后者覆盖得到。两个计数器分开，才能分辨是配置问题还是客户端不走这条路。
-    if (state.rewrites > 0 || state.mediaRewrites > 0) style = "good";
-    else if (state.calls === 0 && state.mediaCalls === 0) lines.push("未收到任何流量：检查模块版本与 MitM");
+    if (state.rewrites > 0 || state.grpcRewrites > 0 || state.mediaRewrites > 0) style = "good";
+    else if (state.calls === 0 && state.grpcCalls === 0 && state.mediaCalls === 0) {
+      lines.push("未收到任何流量：检查模块版本与 MitM");
+    }
     else if (state.calls > 0 && state.signals === 0) lines.push("接口已触发但响应里没有媒体地址");
     else lines.push("有流量但无需改写");
 
@@ -914,6 +928,204 @@
     }
   }
 
+  // ---- gRPC / protobuf -----------------------------------------------------
+  // PlayViewUnite / PlayConf 这类 gRPC 响应的 body 是 protobuf，媒体 URL 是
+  // length-delimited 字符串字段。这里不做 schema 解析，而是在字节层：
+  //   递归走一遍 message 结构 → 认出主机名 → 替换 → 同步修正长度前缀
+  // 没有发生替换时输出与输入逐字节相同（由测试守着），所以识别失误不会损坏响应；
+  // 另外替换后还会再校验一次能否解析，失败就整段放弃。
+  // B 站在持续把 HTTP 接口迁到 gRPC，所以判定按内容做，不按方法名写死。
+
+  var PROTO_ANCHORS = [".bilivideo.com", ".bilivideo.cn", ".bilivideo.net", ".akamaized.net"];
+  var PROTO_MAX_DEPTH = 12;
+
+  function isHostByte(c) {
+    return (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 45 || c === 46;
+  }
+
+  function readVarint(buf, pos, end) {
+    var value = 0;
+    var shift = 0;
+    while (pos < end) {
+      var b = buf[pos];
+      pos += 1;
+      value += (b & 127) * Math.pow(2, shift);
+      if ((b & 128) === 0) return { value: value, next: pos };
+      shift += 7;
+      if (shift > 63) return null;
+    }
+    return null;
+  }
+
+  function varintBytes(value) {
+    var out = [];
+    var v = value;
+    do {
+      var b = v % 128;
+      v = Math.floor(v / 128);
+      out.push(v > 0 ? b + 128 : b);
+    } while (v > 0);
+    return out;
+  }
+
+  // 找出 [start,end) 里所有形如 <sub>.<anchor> 的主机名区间，按出现位置升序。
+  function hostSpans(buf, start, end) {
+    var spans = [];
+    for (var a = 0; a < PROTO_ANCHORS.length; a++) {
+      var anchor = PROTO_ANCHORS[a];
+      var alen = anchor.length;
+      var i = start;
+      while (i + alen <= end) {
+        var match = true;
+        for (var k = 0; k < alen; k++) {
+          if (buf[i + k] !== anchor.charCodeAt(k)) { match = false; break; }
+        }
+        if (!match) { i += 1; continue; }
+        var hs = i;
+        while (hs > start && isHostByte(buf[hs - 1])) hs -= 1;
+        spans.push({ start: hs, end: i + alen });
+        i = i + alen;
+      }
+    }
+    spans.sort(function (x, y) { return x.start - y.start; });
+    var out = [];
+    for (i = 0; i < spans.length; i++) {
+      if (!out.length || spans[i].start >= out[out.length - 1].end) out.push(spans[i]);
+    }
+    return out;
+  }
+
+  function spanHost(buf, span) {
+    var s = "";
+    for (var i = span.start; i < span.end; i++) s += String.fromCharCode(buf[i]);
+    return s.toLowerCase();
+  }
+
+  // 只按主机名判定：protobuf 里我们能确认的只有主机名这一段，拿不到 query / 端口。
+  function shouldMoveHost(host, cfg, rank) {
+    if (host === bestHost(cfg, rank)) return false;
+    var ranked = !!(rank && rank.ranking.length);
+    var forceAll = cfg.mode === "force" || (cfg.mode === "smart" && ranked);
+    if (isMcdnHost(host) && cfg.mcdnStrategy !== "off") return true;
+    if (isKnownP2pHost(host) || IP_RE.test(host) || XY_MCDN_RE.test(host)) return true;
+    if (/\.akamaized\.net$/i.test(host)) return forceAll || cfg.rewriteAkamai;
+    if (forceAll && isBiliCdnHost(host)) return true;
+    return false;
+  }
+
+  // 返回替换后的字节（Uint8Array），无需替换时返回 null。
+  function swapHostsInBytes(buf, start, end, cfg, rank, stats) {
+    var spans = hostSpans(buf, start, end);
+    if (!spans.length) return null;
+    var target = bestHost(cfg, rank);
+    var swaps = [];
+    for (var i = 0; i < spans.length; i++) {
+      var host = spanHost(buf, spans[i]);
+      if (!shouldMoveHost(host, cfg, rank)) continue;
+      swaps.push({ start: spans[i].start, end: spans[i].end, host: host });
+    }
+    if (!swaps.length) return null;
+
+    var out = [];
+    var cursor = start;
+    for (i = 0; i < swaps.length; i++) {
+      var sw = swaps[i];
+      for (var j = cursor; j < sw.start; j++) out.push(buf[j]);
+      for (j = 0; j < target.length; j++) out.push(target.charCodeAt(j));
+      cursor = sw.end;
+      if (stats) {
+        stats.grpcRewrites += 1;
+        stats.details.push({ reason: "grpc-host", from: sw.host, to: target });
+      }
+    }
+    for (j = cursor; j < end; j++) out.push(buf[j]);
+    return new Uint8Array(out);
+  }
+
+  // 递归重建：valid 表示这段字节确实是一个合法 message；out 非空表示内部发生了替换。
+  function walkMessage(buf, start, end, cfg, rank, stats, depth) {
+    var invalid = { valid: false, out: null };
+    if (depth > PROTO_MAX_DEPTH) return invalid;
+    var pos = start;
+    // 每个字段先记成一段：未改动的是原始区间，改动的是重编码后的字节。
+    // 全部记完再按需展开 —— 否则某字段一旦被替换，它之前的字段就丢了。
+    var segs = [];
+    var changed = false;
+
+    while (pos < end) {
+      var segStart = pos;
+      var tag = readVarint(buf, pos, end);
+      if (!tag || tag.value === 0) return invalid;
+      pos = tag.next;
+      var tagEnd = pos;
+      var wire = tag.value & 7;
+
+      if (wire === 0) {
+        var v = readVarint(buf, pos, end);
+        if (!v) return invalid;
+        pos = v.next;
+        segs.push({ a: segStart, b: pos });
+      } else if (wire === 1) {
+        if (pos + 8 > end) return invalid;
+        pos += 8;
+        segs.push({ a: segStart, b: pos });
+      } else if (wire === 5) {
+        if (pos + 4 > end) return invalid;
+        pos += 4;
+        segs.push({ a: segStart, b: pos });
+      } else if (wire === 2) {
+        var len = readVarint(buf, pos, end);
+        if (!len) return invalid;
+        var lenEnd = len.next;
+        var payStart = lenEnd;
+        var payEnd = payStart + len.value;
+        if (payEnd > end) return invalid;
+
+        var sub = walkMessage(buf, payStart, payEnd, cfg, rank, stats, depth + 1);
+        var replaced = sub.valid
+          ? sub.out                                              // 是 message：以递归结果为准
+          : swapHostsInBytes(buf, payStart, payEnd, cfg, rank, stats);   // 不是：当字符串处理
+        if (replaced) {
+          // tag 原样，长度前缀按新 payload 重写，payload 用替换结果
+          var blk = [];
+          for (var q = segStart; q < tagEnd; q++) blk.push(buf[q]);
+          var newLen = varintBytes(replaced.length);
+          for (q = 0; q < newLen.length; q++) blk.push(newLen[q]);
+          for (q = 0; q < replaced.length; q++) blk.push(replaced[q]);
+          segs.push({ bytes: blk });
+          changed = true;
+        } else {
+          segs.push({ a: segStart, b: payEnd });
+        }
+        pos = payEnd;
+      } else {
+        return invalid;
+      }
+    }
+
+    if (pos !== end) return invalid;
+    if (!changed) return { valid: true, out: null };
+
+    var flat = [];
+    for (var i = 0; i < segs.length; i++) {
+      if (segs[i].bytes) {
+        for (var j = 0; j < segs[i].bytes.length; j++) flat.push(segs[i].bytes[j]);
+      } else {
+        for (var k = segs[i].a; k < segs[i].b; k++) flat.push(buf[k]);
+      }
+    }
+    return { valid: true, out: new Uint8Array(flat) };
+  }
+
+  function rewriteProto(buf, cfg, rank, stats) {
+    var result = walkMessage(buf, 0, buf.length, cfg, rank, stats, 0);
+    if (!result.out) return null;
+    // 替换后必须仍能解析，否则整段放弃（宁可不动，也不要写出坏 body）
+    var verify = walkMessage(result.out, 0, result.out.length, cfg, null, null, 0);
+    if (!verify.valid) return null;
+    return result.out;
+  }
+
   function responseHeaders() {
     var out = {};
     var src = ($response && $response.headers) || {};
@@ -936,6 +1148,33 @@
       var out = null;
 
       if (!cfg.enabled || cfg.mode === "off") return done();
+
+      // gRPC：模块那行开了 binary-body-mode，body 是 Uint8Array 而不是字符串。
+      if (body && typeof body !== "string" && typeof body.length === "number") {
+        var bytes = body instanceof Uint8Array ? body : new Uint8Array(body);
+        var gstats = { count: 0, reasons: {}, details: [], signal: true, binary: true, grpcRewrites: 0 };
+        var gRank = loadRank(cfg);
+
+        // gRPC 层的消息可能被 gzip 压过，替换后无法重新压缩，只能原样放过。
+        var gzipped = bytes.length > 2 && bytes[0] === 31 && bytes[1] === 139;
+        if (cfg.grpcRewrite && !gzipped) {
+          out = rewriteProto(bytes, cfg, gRank, gstats);
+        }
+        gstats.count = gstats.grpcRewrites;
+        recordResponse(cfg, gstats, false, gRank);
+
+        if (cfg.debug) {
+          log("grpc: " + reqUrl.split("?")[0] + " bytes=" + bytes.length +
+            (gzipped ? " gzip-skip" : "") + " rewrites=" + gstats.grpcRewrites);
+          for (var gi = 0; gi < gstats.details.length && gi < MAX_LOGGED_DETAILS; gi++) {
+            log("  " + gstats.details[gi].from + " -> " + gstats.details[gi].to);
+          }
+        }
+
+        if (out !== null) done({ body: out, headers: responseHeaders() });
+        else done();
+        return;
+      }
 
       stats.signal = typeof body === "string" && hasMediaSignal(body);
       if (stats.signal) parsed = safeParse(body);
@@ -1021,6 +1260,8 @@
       enrichBackups: enrichBackups,
       filterLiveUrlInfo: filterLiveUrlInfo,
       findSample: findSample,
+      rewriteProto: rewriteProto,
+      shouldMoveHost: shouldMoveHost,
       rankSamples: rankSamples,
       throughputMbps: throughputMbps,
       loadConfig: loadConfig,
