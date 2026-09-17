@@ -89,6 +89,17 @@ Surge（接口/Grpc 层需要 MitM，分片层不需要）
 `DEFAULTS` 里的测速有效期 / 样本有效期 / 探测超时与字节数。测速频率改模块里的 `cronexp`。
 `mcdnStrategy`（`proxy` 代理包裹 / `replace` 换 host / `off`）也只在 `DEFAULTS` 里，不在参数表。
 
+### 发版时版本号要改三处
+
+`bili-cdn.js` 的 `VERSION`、五条 `script-path` 的 `?v=`、模块头部的 `#!desc=`。少改一处就会出现"改了却没生效" ——
+**Surge 对模块文件和远程脚本都会缓存**：
+
+- 远程脚本的缓存由 `script-update-interval` 控制（默认 `86400` = 24 小时，本模块设为 `1800` = 30 分钟）
+- 模块文件本身也会缓存，所以 `#!desc` 带版本号 —— 模块列表里一眼能看出拿到的是哪一版
+- `raw.githubusercontent.com` 自己也有 CDN 缓存，刚 push 完可能取到旧内容（等一两分钟）
+
+判断设备实际加载了哪一版：**模块列表看 `#!desc`，面板标题看 `VERSION`**。排查任何问题前先看这两处。
+
 ## 怎么确认生效
 
 **看面板。** 策略选择页的「B站CDN」卡片：
