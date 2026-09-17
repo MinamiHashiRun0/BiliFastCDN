@@ -11,7 +11,7 @@
   var K_STATS = "bili_fast_cdn.stats.v1";
 
   // Surge 对远程脚本默认缓存 86400 秒，面板标题带版本号才能确认设备上跑的是哪一版。
-  var VERSION = "0.1.9";
+  var VERSION = "0.2.0";
   var PANEL_TITLE = "B站CDN";
   var REASON_LABELS = {
     "force-host": "全量改写",
@@ -356,7 +356,8 @@
       via: j.via || "",
       fresh: (Date.now() - (j.at || 0)) < cfg.rankTtlMs,
       ranking: hosts,
-      samples: j.samples || []
+      samples: j.samples || [],
+      rejected: j.rejected || []
     };
   }
 
@@ -399,21 +400,31 @@
     return "pcdn";
   }
 
-  // 某个来源主机该换到哪：分类覆盖优先（auto 表示不覆盖），否则用测速排名第一。
+  // 用户手填的分类固定目标，auto 表示没填（那就用测速排名）。
+  function pinnedFor(cfg, host) {
+    var category = categoryOf(host);
+    var override = category === "oversea" ? cfg.hostOversea
+      : (category === "bstar" ? cfg.hostBStar : cfg.hostPcdn);
+    return override && override !== "auto" ? override : null;
+  }
+
+  // 某个来源主机该换到哪：分类固定目标优先，否则用测速排名第一。
   function targetFor(cfg, rank, host) {
     // MCDN 走代理包裹时，字节层只能换主机名（拿不到整条 URL），所以这里落到
     // hostMcdn —— 与 Redirect 把 mcdn 主机名换成 proxy-tf-all-ws 的做法一致。
     if (isMcdnHost(host) && cfg.mcdnStrategy === "proxy") return cleanHost(cfg.hostMcdn);
-    var category = categoryOf(host);
-    var override = category === "oversea" ? cfg.hostOversea
-      : (category === "bstar" ? cfg.hostBStar : cfg.hostPcdn);
-    if (override && override !== "auto") return override;
-    return bestHost(cfg, rank);
+    return pinnedFor(cfg, host) || bestHost(cfg, rank);
   }
 
-  // smart: 有测速结果时按 force 处理，没有结果时只动劣质节点。
-  // force: 总是改写。bad-only: 只动 PCDN / MCDN 等劣质节点。
-  function rewriteOne(rawUrl, cfg, rank) {
+  // smart: 响应层全量改写，分片层只动劣质节点。
+  // force: 两层都全量改写。bad-only: 只动 PCDN / MCDN 等劣质节点。
+  //
+  // 分片层（scope=media）为什么在 smart 下不全量改写：http-request 拿到的是播放器
+  // 已经在用的那条 URL，换掉之后播放器手上没有第二条地址可退。实测把一条分片的主备
+  // 候选（akam / cosov）都收敛到同一个主机名之后，该主机名在本地解析到一个没有该域名
+  // 的 CDN 边缘（403 X-Tengine-Error: non-existent domain），主备一起失败，整集放不出来。
+  // 响应层能全量改写是因为那里还能补 backupUrl 扇出，分片层补不了。
+  function rewriteOne(rawUrl, cfg, rank, scope) {
     if (!hasMediaSignal(rawUrl)) return null;
     var p = parseUrl(rawUrl);
     if (!p || !isMediaPath(p) || isLivePath(p)) return null;
@@ -421,7 +432,8 @@
 
     var v = classify(p, cfg);
     var target = targetFor(cfg, rank, p.host);
-    var forceAll = cfg.mode === "force" || (cfg.mode === "smart" && !!(rank && rank.ranking.length));
+    var forceAll = cfg.mode === "force" ||
+      (cfg.mode === "smart" && scope !== "media" && !!(rank && rank.ranking.length));
 
     // 已经是目标节点就直接放过：http-request 改写后 Surge 会拿新 URL 重跑脚本，
     // 这一行断开回环。
@@ -443,7 +455,8 @@
       return moved(swapHost(rawUrl, target, p.scheme), p.host, target, "akamai-host");
     }
 
-    if (forceAll && isBiliCdnHost(p.host) && p.host !== target) {
+    // 分类固定目标是用户手填的，分片层同样照办 —— 那是显式意图，不是测速猜的。
+    if ((forceAll || pinnedFor(cfg, p.host)) && isBiliCdnHost(p.host) && p.host !== target) {
       return moved(swapHost(rawUrl, target, p.scheme), p.host, target, "force-host");
     }
     return null;
@@ -787,12 +800,13 @@
     });
   }
 
-  function saveRank(ranked, via) {
+  function saveRank(ranked, via, results) {
     var payload = {
       at: Date.now(),
       via: via,
       ranking: [],
-      samples: []
+      samples: [],
+      rejected: []
     };
     for (var i = 0; i < ranked.length; i++) {
       payload.ranking.push(ranked[i].host);
@@ -802,6 +816,14 @@
         ms: ranked[i].ms
       });
     }
+    // 被剔除的候选要留痕：测速时 403 的节点不可能是好的目标，但用户得看得见
+    // "我选的这个节点当时就被否了"，而不是只看到一个空排名。
+    var all = results || [];
+    for (i = 0; i < all.length; i++) {
+      if (all[i] && !all[i].ok) {
+        payload.rejected.push({ host: all[i].host, status: all[i].status || 0 });
+      }
+    }
     writeStore(K_RANK, JSON.stringify(payload));
   }
 
@@ -810,6 +832,17 @@
       .replace(/\.bilivideo\.(com|cn|net)$/, "")
       .replace(/\.akamaized\.net$/, "")
       .replace(/^upos-/, "");
+  }
+
+  // 测速时被否掉的候选，最多列两个，剩下的折成 +N。
+  function rejectedTail(rejected) {
+    if (!rejected || !rejected.length) return "";
+    var parts = [];
+    for (var i = 0; i < rejected.length && i < 2; i++) {
+      parts.push(shorten(rejected[i].host) + (rejected[i].status ? "(" + rejected[i].status + ")" : ""));
+    }
+    if (rejected.length > 2) parts.push("+" + (rejected.length - 2));
+    return " · 剔除 " + parts.join(" ");
   }
 
   function reasonLabel(reason) {
@@ -865,7 +898,7 @@
 
       if (!ranked.length) return cb(null, via);
 
-      saveRank(ranked, via);
+      saveRank(ranked, via, results);
       log("probe: via=" + via + " best=" + ranked[0].host + " " +
         ranked[0].mbps.toFixed(2) + "Mbps " + ranked[0].ms + "ms");
       cb(ranked, via);
@@ -941,7 +974,8 @@
       var rate = best && best.mbps ? best.mbps.toFixed(1) + " Mbps" : (best ? "延迟 " + best.ms + "ms" : "");
       var ageMin = Math.round((Date.now() - rank.at) / 60000);
       lines.push("目标 " + shorten(rank.ranking[0]) + (rate ? " · " + rate : ""));
-      lines.push("测速 " + (ageMin < 1 ? "刚刚" : ageMin + " 分钟前") + " · " + rank.ranking.length + " 个节点");
+      lines.push("测速 " + (ageMin < 1 ? "刚刚" : ageMin + " 分钟前") + " · " + rank.ranking.length + " 个节点" +
+        rejectedTail(rank.rejected));
     } else {
       lines.push(shorten(DEFAULT_HOST) + "（兜底，尚未测速）");
       lines.push(note ? note : "点刷新按钮立即测速");
@@ -959,6 +993,10 @@
     lines.push("gRPC 扫描" + state.grpcCalls + " 改写" + state.grpcRewrites + gTail);
     lines.push("分片 扫描" + state.mediaCalls + " 改写" + state.mediaRewrites +
       (state.liveDropped ? " 直播剔除" + state.liveDropped : ""));
+    // 分片层在 smart 下只修劣质节点，改写 0 是常态。写在卡片上，省得又去猜是不是没生效。
+    if (cfg.mode === "smart" && state.mediaCalls > state.mediaRewrites) {
+      lines.push("分片 smart 只修劣质节点（force 才全量）");
+    }
     if (state.last) {
       lines.push("最近 " + reasonLabel(state.last.reason) + "：" +
         shorten(state.last.from) + " → " + shorten(state.last.to));
@@ -978,6 +1016,7 @@
 
   // 明文 HTTP 的分片请求走这一支：不需要 MitM，所以官方 App 也覆盖得到（它的
   // playurl 是 gRPC/protobuf，payload 改写碰不到，但它的分片是 http）。
+  // scope=media 让 smart 模式在这里退化成"只修劣质节点"，理由见 rewriteOne。
   function runRequest(cfg) {
     try {
       var url = ($request && $request.url) || "";
@@ -986,7 +1025,7 @@
       var p = parseUrl(url);
       if (!p || !isMediaPath(p) || isLivePath(p)) return done();
 
-      var hit = rewriteOne(url, cfg, loadRank(cfg));
+      var hit = rewriteOne(url, cfg, loadRank(cfg), "media");
       recordRequest(cfg, hit);
       if (!hit) return done();
 
@@ -1077,17 +1116,13 @@
   // 字节层（gRPC）只清劣质节点，不碰健康节点。
   // 原因：JSON 层改写后能补 backupUrl 扇出，protobuf 里补不了 —— 把健康节点也收敛到
   // 同一个 host 等于拆掉播放器自己的多 CDN 容错，那个 host 一抖整段就卡。
-  // "选最快"交给按请求改写的分片层，那里失败只影响单个分片。
   function shouldMoveHost(host, cfg, rank) {
-    var category = categoryOf(host);
-    var pinned = (category === "oversea" ? cfg.hostOversea
-      : (category === "bstar" ? cfg.hostBStar : cfg.hostPcdn)) !== "auto";
     if (host === targetFor(cfg, rank, host)) return false;
     if (isMcdnHost(host) && cfg.mcdnStrategy !== "off") return true;
     if (isKnownP2pHost(host) || IP_RE.test(host) || XY_MCDN_RE.test(host)) return true;
     if (/\.akamaized\.net$/i.test(host)) return cfg.rewriteAkamai;
     // 用户明确指定了该分类的目标（不是 auto）时，健康节点也照换 —— 那是显式意图。
-    if (pinned) return true;
+    if (pinnedFor(cfg, host)) return true;
     return false;
   }
 
