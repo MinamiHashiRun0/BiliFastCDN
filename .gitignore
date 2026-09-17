@@ -1,0 +1,12 @@
+# 操作系统 / 编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# 对照测试用的上游脚本：按 README 说明自行放到本地即可，
+# 不随本仓库分发（其署名见 THIRD-PARTY-NOTICES.md）。
+test/fixtures/
+
+# 本地临时产物
+*.log

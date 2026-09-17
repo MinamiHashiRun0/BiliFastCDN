@@ -1,0 +1,851 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>running</title>
+<pre id="report">running…</pre>
+<script>
+// Surface anything that escapes the suite, instead of leaving "running…" behind.
+function fail(reason) {
+  document.title = "ERROR";
+  const el = document.getElementById("report");
+  el.textContent = el.textContent + "\n\n!! THREW\n\n" + reason;
+}
+window.addEventListener("error", (e) => fail((e.error && e.error.stack) || e.message));
+window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.stack) || String(e.reason)));
+</script>
+<script>
+/*
+ * Offline verification for ../bili-cdn.js.
+ *
+ * Runs the script the way Surge would — inside a fake environment that provides
+ * $script / $request / $response / $httpClient / $persistentStore / $done — and
+ * checks each rewrite decision against the reference implementation it was
+ * ported from (bilibili-accelerator.user.js).
+ *
+ * Chrome refuses to read a file:// page's siblings without an explicit flag, so:
+ *
+ *   chrome --headless=new --disable-gpu --allow-file-access-from-files \
+ *          --virtual-time-budget=10000 --dump-dom test/verify.html
+ *
+ * Set the REF constant below to the userscript if it lives elsewhere; when it
+ * cannot be read the oracle section is skipped and reported as such.
+ */
+
+(async function () {
+  "use strict";
+
+  // Where to look for the reference userscript. Drop a copy of
+  // bilibili-accelerator.user.js into test/fixtures/ to make the comparison work
+  // wherever this repo lives; the absolute path is just this machine's copy.
+  const REF_CANDIDATES = [
+    "./fixtures/bilibili-accelerator.user.js",
+    "file:///E:/Downloads/bilibili-accelerator.user.js"
+  ];
+  const K_SAMPLE = "bili_fast_cdn.sample.v1";
+  const K_RANK = "bili_fast_cdn.rank.v1";
+  const K_STATS = "bili_fast_cdn.stats.v1";
+  const TARGET = "upos-tf-all-hw.bilivideo.com";
+
+  const lines = [];
+  let pass = 0;
+  const failures = [];
+
+  function check(name, actual, expected) {
+    const a = JSON.stringify(actual);
+    const e = JSON.stringify(expected);
+    if (a === e) { pass += 1; return; }
+    failures.push(name + "\n     expected " + e + "\n     actual   " + a);
+  }
+  function checkTrue(name, actual) { check(name, !!actual, true); }
+  function note(text) { lines.push("   " + text); }
+
+  // Rendered after every section, so a crash mid-suite still shows how far it got.
+  function render(final) {
+    const total = pass + failures.length;
+    const head = final
+      ? (pass === total ? "ALL " + total + " CHECKS PASSED" : (total - pass) + " OF " + total + " CHECKS FAILED")
+      : "progress: " + pass + " passed, " + failures.length + " failed";
+    document.querySelector("#report").textContent = head + "\n" + lines.join("\n") +
+      (failures.length ? "\n\nFAILURES\n\n" + failures.map((f) => "  " + f).join("\n\n") : "");
+  }
+
+  function section(title) {
+    lines.push("");
+    lines.push("── " + title);
+    render(false);
+  }
+
+  // ---- a deterministic clock ----------------------------------------------
+  // Surge measures a probe as (bytes, elapsed). Chrome's --virtual-time-budget
+  // fires timers early and would collapse every elapsed time to zero, so the
+  // clock is driven by the stub instead: a request that "takes 400ms" advances
+  // Date.now() by exactly 400ms.
+  const clock = { now: 1700000000000 };
+  Date.now = () => clock.now;
+
+  async function readText(url) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return res.text();
+  }
+
+  const SOURCE = await readText("../bili-cdn.js");
+
+  // The script's export block keys off `module`, which is how the suite reaches
+  // its internals without a bundler.
+  window.module = { exports: {} };
+  window.eval(SOURCE);
+  const api = window.module.exports;
+
+  function runSurge(globals) {
+    return new Promise((resolve, reject) => {
+      const store = Object.assign({}, globals.store || {});
+      const run = {
+        store, logs: [], notifications: [], httpCalls: [],
+        donePayload: null, doneCount: 0
+      };
+
+      window.$persistentStore = {
+        read: (k) => (Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null),
+        write: (v, k) => { store[k] = String(v); return true; }
+      };
+      window.$notification = { post: (...args) => run.notifications.push(args) };
+      window.$httpClient = {
+        get: (opts, cb) => {
+          const spec = globals.http ? globals.http(opts) : { status: 200, data: "" };
+          run.httpCalls.push(opts);
+          const issuedAt = clock.now;
+          const delay = spec.delay || 0;
+          // Probes run in parallel, so each one finishes at issuedAt + its own
+          // latency. Advancing a shared clock instead would make every probe's
+          // measured time the running sum of the other probes' latencies.
+          setTimeout(() => {
+            clock.now = issuedAt + delay;
+            if (spec.error) cb(new Error("stub error"), null, null);
+            else cb(null, { status: spec.status, headers: spec.headers || {} }, spec.data);
+          }, delay);
+        }
+      };
+      window.$done = (payload) => {
+        run.doneCount += 1;
+        run.donePayload = payload === undefined ? null : payload;
+        resolve(run);
+      };
+      window.$argument = globals.argument;
+      window.$script = globals.script;
+      window.console.log = (m) => run.logs.push(String(m));
+
+      if (globals.response) window.$response = globals.response; else delete window.$response;
+      if (globals.request) window.$request = globals.request; else delete window.$request;
+      if (globals.input) window.$input = globals.input; else delete window.$input;
+      if (globals.trigger) window.$trigger = globals.trigger; else delete window.$trigger;
+
+      try {
+        window.eval(SOURCE);
+      } catch (e) {
+        reject(e);
+        return;
+      }
+      setTimeout(() => resolve(run), 2000);
+    });
+  }
+
+  const hostOf = (url) => { const p = api.parseUrl(url); return p ? p.host : null; };
+  const tailOf = (url) => { const p = api.parseUrl(url); return p ? p.tail : null; };
+  // Mirrors the script's own host shortening, for asserting on panel text.
+  const shorten = (host) => String(host).replace(/\.bilivideo\.com$/, "").replace(/^upos-/, "");
+
+  // ---- 1. url primitives --------------------------------------------------
+
+  section("url primitives");
+  {
+    const q = "?deadline=1700000000&oi=123&uipk=5&os=cos&sign=abc%2Fdef&nbs=1";
+    const media = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3-1-30080.m4s" + q;
+    const p = api.parseUrl(media);
+
+    check("parseUrl host", p.host, "upos-sz-mirrorcos.bilivideo.com");
+    check("parseUrl path", p.path, "/upgcxcode/1/2/3-1-30080.m4s");
+    check("parseUrl keeps an empty port for a default port", p.port, "");
+    checkTrue("isMediaPath recognises a segment", api.isMediaPath(p));
+    checkTrue("hasMediaSignal sees the host", api.hasMediaSignal(media));
+
+    // The query is the signature. It has to survive byte-for-byte.
+    check("swapHost preserves the query verbatim", tailOf(api.swapHost(media, TARGET)), tailOf(media));
+    check("swapHost rewrites the host", hostOf(api.swapHost(media, TARGET)), TARGET);
+    check("swapHost forces https", api.swapHost(media, TARGET).slice(0, 8), "https://");
+    check("swapHost handles protocol-relative urls",
+      api.swapHost("//upos-sz-mirrorcos.bilivideo.com/upgcxcode/1.m4s?a=1", TARGET),
+      "https://" + TARGET + "/upgcxcode/1.m4s?a=1");
+    check("swapHost drops a non-default port",
+      api.swapHost("https://xy1x2x3x4xy.mcdn.bilivideo.cn:486/v1/resource/3.m4s?os=mcdn", TARGET),
+      "https://" + TARGET + "/v1/resource/3.m4s?os=mcdn");
+    check("swapHost handles a url with no path",
+      api.swapHost("https://upos-sz-mirrorcos.bilivideo.com", TARGET), "https://" + TARGET);
+    check("swapHost rejects a non-string", api.swapHost(null, TARGET), null);
+    const odd = "https://upos-sz-mirrorcos.bilivideo.com/1.m4s?a=%20%2B&b=x";
+    check("swapHost leaves an odd query alone", tailOf(api.swapHost(odd, TARGET)), tailOf(odd));
+    check("cleanHost strips scheme and path",
+      api.cleanHost("https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/x.m4s"), "upos-sz-mirrorcos.bilivideo.com");
+    check("cleanHost lowercases", api.cleanHost("UPOS-SZ-MirrorCOS.bilivideo.com"), "upos-sz-mirrorcos.bilivideo.com");
+    check("parseUrl rejects a non-url", api.parseUrl("not-a-url"), null);
+    check("pool size", api.CANDIDATE_POOL.length, 8);
+  }
+
+  // ---- 2. configuration ---------------------------------------------------
+
+  section("configuration");
+  {
+    check("query-string argument", api.parseArgument("enabled=false&mode=force&notify=no"),
+      { enabled: "false", mode: "force", notify: "no" });
+    check("json argument", api.parseArgument('{"mode":"bad-only"}'), { mode: "bad-only" });
+    check("empty argument", api.parseArgument(""), {});
+    check("missing argument", api.parseArgument(undefined), {});
+    // Surge older than 5.10 ignores #!arguments and leaves the braces in place.
+    check("unresolved placeholder is ignored", api.parseArgument("mode={{{mode}}}&enabled=true"), { enabled: "true" });
+    check("url-encoded value", api.parseArgument("mode=smart&x=a%20b"), { mode: "smart", x: "a b" });
+
+    const cfg = api.loadConfig();
+    check("default mode", cfg.mode, "smart");
+    check("default mcdn strategy", cfg.mcdnStrategy, "replace");
+    check("default notify", cfg.notify, true);
+    check("default rank ttl", cfg.rankTtlMs, 6 * 60 * 60 * 1000);
+    check("unknown mode falls back", api.loadConfig().mode, "smart");
+  }
+
+  // ---- 3. classification against the reference ----------------------------
+
+  const CORPUS = [
+    "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&oi=2&os=cos&sign=abc",
+    "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&os=cosov&sign=abc",
+    "https://upos-sz-mirroraliov.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&sign=abc",
+    "https://upos-hz-mirrorakam.akamaized.net/upgcxcode/1/2/3.m4s?deadline=1&sign=abc",
+    "https://upos-sz-mirrorcos.bilivideo.com:4480/upgcxcode/1/2/3.m4s?deadline=1&sign=abc",
+    "https://123.45.67.89/upgcxcode/1/2/3.m4s?deadline=1&sign=abc",
+    "https://upos-sz-mirror14b.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&sign=abc",
+    "https://upos-sz-302ppio.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&sign=abc",
+    "https://edge.node.mountaintoys.cn/upgcxcode/1/2/3.m4s?deadline=1&sign=abc",
+    "https://xy1x2x3x4xy.mcdn.bilivideo.cn:486/v1/resource/3.m4s?os=mcdn&deadline=1&sign=abc",
+    "https://xy1x2x3x4xy.mcdn.bilivideo.com/v1/resource/3.m4s?deadline=1&sign=abc",
+    "https://foo.szbdyd.com/upgcxcode/1/2/3.m4s?xy_usource=upos-sz-mirrorhw.bilivideo.com&deadline=1&sign=abc",
+    "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?os=mcdn&deadline=1&sign=abc",
+    "https://upos-sz-mirrorhw.bilivideo.com/9/8/7.flv?deadline=1&sign=abc",
+    "https://upos-sz-mirrorali.bilivideo.com/1/2/3.mp4?deadline=1&sign=abc",
+    "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s",
+    "https://upos-sz-mirrorcos.bilivideo.com/index.html",
+    "https://api.bilibili.com/x/player/playurl?bvid=BV1&cid=1"
+  ];
+
+  section("classification vs the reference userscript");
+  {
+    let ref = null;
+    for (const candidate of REF_CANDIDATES) {
+      try {
+        const refSrc = await readText(candidate);
+        // The second half of that file is page UI and would install itself into
+        // this page; the core it exports is all the comparison needs.
+        const cut = refSrc.indexOf("(function installBiliAccelerator");
+        window.eval(cut > 0 ? refSrc.slice(0, cut) : refSrc);
+        ref = window.BiliAcceleratorCore;
+        note("compared against " + candidate);
+        break;
+      } catch (e) {
+        // try the next location
+      }
+    }
+    if (!ref) {
+      note("reference userscript not readable — oracle comparison SKIPPED");
+      note("put it at test/fixtures/bilibili-accelerator.user.js to enable it");
+    }
+
+    if (ref) {
+      const refCfg = {
+        enabled: true, mode: "force", selection: "fixed", pcdnHost: TARGET,
+        mcdnStrategy: "proxy-all", rewriteAkamai: false, portHeuristic: true, schemaVersion: 3
+      };
+      const myCfg = Object.assign({}, api.DEFAULTS, { mode: "force", mcdnStrategy: "proxy" });
+      const rank = { ranking: [TARGET] };
+
+      for (const url of CORPUS) {
+        const r = ref.classify(new URL(url), refCfg);
+        const m = api.classify(api.parseUrl(url), myCfg);
+        check("classify pcdn   " + url, m.pcdn, r.isPcdn);
+        check("classify mcdn   " + url, m.mcdn, r.isMcdn);
+        check("classify akamai " + url, m.akamai, r.isAkamai);
+
+        const refOut = ref.rewriteUrlDetail(url, refCfg);
+        const myOut = api.rewriteOne(url, myCfg, rank);
+        check("rewrite host   " + url,
+          myOut ? hostOf(myOut.url) : hostOf(url),
+          refOut.changed ? hostOf(refOut.url) : hostOf(url));
+        if (refOut.changed && myOut) {
+          check("rewrite tail   " + url, tailOf(myOut.url), tailOf(refOut.url));
+        }
+      }
+      note(CORPUS.length + " urls compared against the reference");
+    }
+  }
+
+  // ---- 4. live payloads ---------------------------------------------------
+
+  section("live playinfo filtering");
+  {
+    const cfg = Object.assign({}, api.DEFAULTS);
+
+    checkTrue("a pcdn live host is slow", api.isSlowLiveHost("https://xy1x2x3x4xy.mcdn.bilivideo.cn:486", "", cfg));
+    checkTrue("a ported live host is slow", api.isSlowLiveHost("https://upos-sz-mirrorcos.bilivideo.com:4480", "", cfg));
+    checkTrue("an os=mcdn live host is slow", api.isSlowLiveHost("https://foo.bilivideo.com", "os=mcdn&x=1", cfg));
+    check("a normal live host is fine", api.isSlowLiveHost("https://upos-sz-mirrorcos.bilivideo.com", "", cfg), false);
+
+    const payload = {
+      code: 0,
+      data: {
+        playurl_info: {
+          playurl: {
+            stream: [{
+              format: [{
+                codec: [{
+                  url_info: [
+                    { host: "https://xy1x2x3x4xy.mcdn.bilivideo.cn:486", extra: "?os=mcdn" },
+                    { host: "https://upos-sz-mirrorcos.bilivideo.com", extra: "" }
+                  ]
+                }]
+              }]
+            }]
+          }
+        }
+      }
+    };
+    check("one url_info entry dropped", api.filterLiveUrlInfo(payload, cfg, 0, new Set()), 1);
+    const kept = payload.data.playurl_info.playurl.stream[0].format[0].codec[0].url_info;
+    check("only the official host survives", kept.length, 1);
+    check("surviving host", kept[0].host, "https://upos-sz-mirrorcos.bilivideo.com");
+
+    // Dropping the last usable host would hard-break live playback.
+    const allBad = {
+      url_info: [
+        { host: "https://xy1x2x3x4xy.mcdn.bilivideo.cn:486", extra: "?os=mcdn" },
+        { host: "https://xy5x6x7x8xy.mcdn.bilivideo.cn:486", extra: "?os=mcdn" }
+      ]
+    };
+    check("an all-pcdn list is left alone", api.filterLiveUrlInfo(allBad, cfg, 0, new Set()), 0);
+    check("an all-pcdn list keeps both", allBad.url_info.length, 2);
+  }
+
+  // ---- 5. ranking ---------------------------------------------------------
+
+  section("ranking");
+  {
+    const ranked = api.rankSamples([
+      { host: "a", ok: true, mbps: 12, ms: 100 },
+      { host: "b", ok: false, mbps: 0, ms: 20 },
+      { host: "c", ok: true, mbps: 40, ms: 300 },
+      { host: "d", ok: true, mbps: 12, ms: 50 }
+    ]);
+    // a and d tie on rate, so the lower latency (d) comes first — the same
+    // tie-break the reference's rankHosts applies.
+    check("throughput decides, latency breaks ties", ranked.map((r) => r.host), ["c", "d", "a"]);
+
+    const latencyOnly = api.rankSamples([
+      { host: "slow", ok: true, mbps: 0, ms: 400 },
+      { host: "fast", ok: true, mbps: 0, ms: 40 }
+    ]);
+    check("latency-only ranking", latencyOnly.map((r) => r.host), ["fast", "slow"]);
+    check("throughput math", Math.round(api.throughputMbps(1048576, 200) * 100) / 100, 41.94);
+    check("throughput of nothing", api.throughputMbps(0, 100), 0);
+  }
+
+  // ---- 6. sample discovery ------------------------------------------------
+
+  section("sample discovery");
+  {
+    const payload = {
+      data: {
+        dash: {
+          video: [{ baseUrl: "https://xy1x2x3x4xy.mcdn.bilivideo.cn:486/v1/resource/v.m4s?os=mcdn" }],
+          audio: [{ baseUrl: "https://upos-sz-mirrorhw.bilivideo.com/upgcxcode/1/2/a.m4s?deadline=1" }]
+        }
+      }
+    };
+    // Video is walked first. A pcdn url is still a fine probe sample: the
+    // signature does not cover the host, which is the premise of the whole module.
+    check("prefers a video segment", api.findSample(payload),
+      "https://xy1x2x3x4xy.mcdn.bilivideo.cn:486/v1/resource/v.m4s?os=mcdn");
+    check("no media url in an empty payload", api.findSample({ data: { dash: {} } }), null);
+  }
+
+  // ---- 7. response role, end to end ---------------------------------------
+
+  section("response role");
+  {
+    const V_URL = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3-1-30080.m4s?deadline=1&oi=2&os=cos&sign=abc";
+    const B_URL = "https://upos-sz-mirrorali.bilivideo.com/upgcxcode/1/2/3-1-30080.m4s?deadline=1&oi=2&os=ali&sign=abc";
+    const A_URL = "https://xy1x2x3x4xy.mcdn.bilivideo.cn:486/v1/resource/3-1-30280.m4s?os=mcdn&deadline=1&sign=abc";
+    const D_URL = "https://upos-sz-mirrorhw.bilivideo.com/upgcxcode/9/8/7.flv?deadline=1&sign=abc";
+    const body = JSON.stringify({
+      code: 0,
+      data: {
+        dash: {
+          duration: 100,
+          video: [{ id: 80, baseUrl: V_URL, backupUrl: [B_URL] }],
+          audio: [{ id: 30280, baseUrl: A_URL }]
+        },
+        durl: [{ url: D_URL }]
+      }
+    });
+    const storedRank = JSON.stringify({
+      at: clock.now, via: "sample", ranking: [TARGET, "upos-sz-mirrorcosov.bilivideo.com"], samples: []
+    });
+
+    const run = await runSurge({
+      script: { type: "http-response" },
+      request: { url: "https://api.bilibili.com/x/player/playurl?bvid=BV1&cid=1&fnval=16" },
+      response: {
+        status: 200,
+        headers: { "Content-Type": "application/json", "Content-Length": String(body.length) },
+        body
+      },
+      argument: "mode=force&notify=false",
+      store: { [K_RANK]: storedRank }
+    });
+
+    check("responded exactly once", run.doneCount, 1);
+    checkTrue("a body came back", run.donePayload && typeof run.donePayload.body === "string");
+
+    const out = JSON.parse(run.donePayload.body);
+    const video = out.data.dash.video[0];
+    const audio = out.data.dash.audio[0];
+    // Every rewritten url must still carry the exact tail Bilibili signed; the
+    // host is not part of the signature, the path and query are.
+    const SIGNED_TAILS = [tailOf(V_URL), tailOf(B_URL), tailOf(A_URL), tailOf(D_URL)];
+
+    check("primary moved to the fastest host", hostOf(video.baseUrl), TARGET);
+    check("the signed tail survived", tailOf(video.baseUrl), tailOf(V_URL));
+    check("mcdn audio moved to the fastest host", hostOf(audio.baseUrl), TARGET);
+    check("the audio tail survived", tailOf(audio.baseUrl), tailOf(A_URL));
+    check("durl moved in force mode", hostOf(out.data.durl[0].url), TARGET);
+    check("the durl tail survived", tailOf(out.data.durl[0].url), tailOf(D_URL));
+    checkTrue("backups were fanned out", Array.isArray(video.backupUrl) && video.backupUrl.length > 1);
+    checkTrue("backups all point at pool hosts",
+      video.backupUrl.every((u) => api.CANDIDATE_POOL.indexOf(hostOf(u)) !== -1));
+    checkTrue("every backup carries a valid signature",
+      video.backupUrl.every((u) => SIGNED_TAILS.indexOf(tailOf(u)) !== -1));
+    // Force mode rewrites the backup entries too, so the original ali url is gone
+    // by host but its signature has to survive on the rewritten entry.
+    checkTrue("the original backup's signature is preserved",
+      video.backupUrl.some((u) => tailOf(u) === tailOf(B_URL)));
+    checkTrue("backups are capped", video.backupUrl.length <= 8);
+    checkTrue("the stale content-length was dropped", run.donePayload.headers["Content-Length"] === undefined);
+    checkTrue("content-type was kept", run.donePayload.headers["Content-Type"] === "application/json");
+    checkTrue("a sample was cached for probing", !!run.store[K_SAMPLE]);
+    check("the cached sample is the pre-rewrite url",
+      hostOf(JSON.parse(run.store[K_SAMPLE]).url), "upos-sz-mirrorcos.bilivideo.com");
+
+    // bad-only must leave a healthy CDN host as Bilibili chose it.
+    const soft = await runSurge({
+      script: { type: "http-response" },
+      request: { url: "https://api.bilibili.com/x/player/playurl?bvid=BV1&cid=1" },
+      response: { status: 200, headers: {}, body },
+      argument: "mode=bad-only",
+      store: { [K_RANK]: storedRank }
+    });
+    const softOut = JSON.parse(soft.donePayload.body);
+    check("bad-only leaves a healthy host alone",
+      hostOf(softOut.data.dash.video[0].baseUrl), "upos-sz-mirrorcos.bilivideo.com");
+    check("bad-only still moves the pcdn host", hostOf(softOut.data.dash.audio[0].baseUrl), TARGET);
+
+    // smart is the default mode: once there is a measured ranking it must move even
+    // a healthy host, otherwise "redirect to the fastest CDN" never happens.
+    const smart = await runSurge({
+      script: { type: "http-response" },
+      request: { url: "https://api.bilibili.com/x/player/playurl?bvid=BV1&cid=1" },
+      response: { status: 200, headers: {}, body },
+      argument: "mode=smart&backup_fanout=false",
+      store: { [K_RANK]: storedRank }
+    });
+    const smartOut = JSON.parse(smart.donePayload.body);
+    check("smart rewrites a healthy host once ranked",
+      hostOf(smartOut.data.dash.video[0].baseUrl), TARGET);
+    check("smart rewrites the legacy durl too",
+      hostOf(smartOut.data.durl[0].url), TARGET);
+
+    // With no ranking there is nothing measured to move toward, so it stays
+    // conservative and only the pcdn host moves — to the fallback host.
+    const smartCold = await runSurge({
+      script: { type: "http-response" },
+      request: { url: "https://api.bilibili.com/x/player/playurl?bvid=BV1&cid=1" },
+      response: { status: 200, headers: {}, body },
+      argument: "mode=smart&backup_fanout=false"
+    });
+    const coldOut = JSON.parse(smartCold.donePayload.body);
+    check("smart leaves a healthy host alone before the first test",
+      hostOf(coldOut.data.dash.video[0].baseUrl), "upos-sz-mirrorcos.bilivideo.com");
+    check("the pcdn host falls back to the default before the first test",
+      hostOf(coldOut.data.dash.audio[0].baseUrl), "upos-sz-mirrorcosov.bilivideo.com");
+
+    // A host Bilibili picked that is not a PCDN node is not ours to move.
+    const CLEAN_URL = "https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/1.m4s?deadline=1";
+    const clean = JSON.stringify({ code: 0, data: { dash: { video: [{ baseUrl: CLEAN_URL }] } } });
+
+    // With fan-out off there is nothing to change, so Surge must keep the original
+    // bytes rather than receive a re-encoded body.
+    const untouched = await runSurge({
+      script: { type: "http-response" },
+      request: { url: "https://api.bilibili.com/x/player/playurl?bvid=BV1&cid=1" },
+      response: { status: 200, headers: {}, body: clean },
+      argument: "mode=bad-only&backup_fanout=false"
+    });
+    check("a clean payload passes through untouched", untouched.donePayload, {});
+
+    // With fan-out on the primary is still left alone; alternates are only added.
+    const fanned = await runSurge({
+      script: { type: "http-response" },
+      request: { url: "https://api.bilibili.com/x/player/playurl?bvid=BV1&cid=1" },
+      response: { status: 200, headers: {}, body: clean },
+      argument: "mode=bad-only&backup_fanout=true"
+    });
+    const fannedOut = JSON.parse(fanned.donePayload.body);
+    check("fan-out leaves the primary alone", fannedOut.data.dash.video[0].baseUrl, CLEAN_URL);
+    check("fan-out gives the player alternates", fannedOut.data.dash.video[0].backupUrl.length, 7);
+
+    const other = await runSurge({
+      script: { type: "http-response" },
+      request: { url: "https://api.bilibili.com/x/player/playurl?bvid=BV1&cid=1" },
+      response: { status: 200, headers: {}, body: JSON.stringify({ code: -404, message: "not found" }) },
+      argument: "mode=force"
+    });
+    check("a non-media json body passes through", other.donePayload, {});
+
+    const off = await runSurge({
+      script: { type: "http-response" },
+      request: { url: "https://api.bilibili.com/x/player/playurl?bvid=BV1&cid=1" },
+      response: { status: 200, headers: {}, body },
+      argument: "enabled=false"
+    });
+    check("a disabled script does nothing", off.donePayload, {});
+
+    const live = await runSurge({
+      script: { type: "http-response" },
+      request: { url: "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo?room_id=1" },
+      response: {
+        status: 200, headers: {},
+        body: JSON.stringify({
+          code: 0,
+          data: {
+            playurl_info: {
+              playurl: {
+                stream: [{
+                  format: [{
+                    codec: [{
+                      url_info: [
+                        { host: "https://xy1x2x3x4xy.mcdn.bilivideo.cn:486", extra: "?os=mcdn" },
+                        { host: "https://upos-sz-mirrorcos.bilivideo.com", extra: "" }
+                      ]
+                    }]
+                  }]
+                }]
+              }
+            }
+          }
+        })
+      },
+      argument: "mode=force"
+    });
+    const liveOut = JSON.parse(live.donePayload.body);
+    check("the live pcdn entry was dropped",
+      liveOut.data.playurl_info.playurl.stream[0].format[0].codec[0].url_info.length, 1);
+    check("the live response was not host-swapped",
+      liveOut.data.playurl_info.playurl.stream[0].format[0].codec[0].url_info[0].host,
+      "https://upos-sz-mirrorcos.bilivideo.com");
+  }
+
+  // ---- 8. debug switch ----------------------------------------------------
+
+  section("debug switch");
+  {
+    const D_URL = "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3-1-30080.m4s?deadline=1&oi=2&os=cos&sign=abc";
+    const payload = JSON.stringify({ code: 0, data: { dash: { video: [{ baseUrl: D_URL }] } } });
+    const rankStore = { [K_RANK]: JSON.stringify({ at: clock.now, via: "sample", ranking: [TARGET, "upos-sz-mirrorcosov.bilivideo.com"], samples: [] }) };
+    const request = { url: "https://api.bilibili.com/x/player/playurl?bvid=BV1&cid=1" };
+    const response = { status: 200, headers: {}, body: payload };
+
+    check("debug defaults to off", api.loadConfig().debug, false);
+
+    // Off: the counters still move, but nothing is posted and nothing is logged.
+    const quiet = await runSurge({
+      script: { type: "http-response" }, request, response,
+      argument: "mode=force", store: Object.assign({}, rankStore)
+    });
+    check("no notification without debug", quiet.notifications.length, 0);
+    const qStats = JSON.parse(quiet.store[K_STATS] || "null");
+    check("a matched response is counted", qStats.responses, 1);
+    check("its rewrites are counted", qStats.rewrites, 2);
+    check("the last rewrite records the move",
+      [qStats.last.from, qStats.last.to], ["upos-sz-mirrorcos.bilivideo.com", TARGET]);
+    check("the last rewrite records the reason", qStats.last.reason, "force-host");
+    check("no decision log without debug", quiet.logs.filter((l) => l.indexOf("->") !== -1).length, 0);
+
+    // On: one rate-limited notification plus the per-decision log lines.
+    const loud = await runSurge({
+      script: { type: "http-response" }, request, response,
+      argument: "mode=force&debug=true", store: Object.assign({}, rankStore)
+    });
+    check("one rewrite notification with debug", loud.notifications.length, 1);
+    check("the notification names the target", loud.notifications[0][1], "2 处 → tf-all-hw");
+    check("the notification shows the move with a readable reason", loud.notifications[0][2],
+      "sz-mirrorcos → tf-all-hw（全量改写）");
+    checkTrue("a summary line was logged",
+      loud.logs.some((l) => l.indexOf("rewrites=2") !== -1 && l.indexOf("target=upos-tf-all-hw") !== -1));
+    checkTrue("a detail line was logged",
+      loud.logs.some((l) => l.indexOf("force-host upos-sz-mirrorcos.bilivideo.com -> upos-tf-all-hw.bilivideo.com") !== -1));
+    // Logs get pasted into bug reports; the signed query must never reach them.
+    checkTrue("no signature material is logged",
+      loud.logs.every((l) => l.indexOf("sign=") === -1 && l.indexOf("deadline=") === -1 && l.indexOf("oi=") === -1));
+
+    // A burst of playurl responses must not post a notification each.
+    const burst = await runSurge({
+      script: { type: "http-response" }, request, response,
+      argument: "mode=force&debug=true",
+      store: Object.assign({}, rankStore, { [K_STATS]: loud.store[K_STATS] })
+    });
+    check("the rewrite notification is rate limited", burst.notifications.length, 0);
+    check("but the counters still accumulate", JSON.parse(burst.store[K_STATS]).rewrites, 4);
+  }
+
+  // ---- 9. panel role ------------------------------------------------------
+
+  section("panel role");
+  {
+    const panelInput = { purpose: "panel", position: "policy-selection", panelName: "BiliFastCDN" };
+    const rankStore = { [K_RANK]: JSON.stringify({ at: clock.now, via: "sample", ranking: [TARGET, "upos-sz-mirrorcosov.bilivideo.com"], samples: [{ host: TARGET, mbps: 41.9, ms: 251 }] }) };
+    const anyProbe = (opts) => {
+      if (opts.url.indexOf("/x/web-interface/popular") !== -1) {
+        return { status: 200, data: JSON.stringify({ data: { list: [{ bvid: "BV1abc", cid: 99 }] } }) };
+      }
+      if (opts.url.indexOf("/x/player/playurl") !== -1) {
+        return { status: 200, data: JSON.stringify({ data: { dash: { video: [{ baseUrl: "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&sign=abc" }] } } }) };
+      }
+      return { status: 200, delay: 20, data: "x".repeat(262144) };
+    };
+
+    // Opening the dashboard must never start a probe round on its own.
+    const idle = await runSurge({
+      script: { type: "generic" }, input: panelInput, trigger: "auto-interval",
+      argument: "mode=smart&notify=false",
+      http: () => { throw new Error("an idle panel refresh must not probe"); }
+    });
+    check("the panel has a title", idle.donePayload.title, "B站CDN");
+    checkTrue("it says it has not been measured yet",
+      idle.donePayload.content.indexOf("尚未测速") !== -1);
+    checkTrue("it tells the user how to measure",
+      idle.donePayload.content.indexOf("点刷新按钮") !== -1);
+    check("an idle refresh makes no requests", idle.httpCalls.length, 0);
+
+    // Tapping refresh is the deliberate "test now" trigger.
+    const tapped = await runSurge({
+      script: { type: "generic" }, input: panelInput, trigger: "button",
+      argument: "mode=smart&notify=false", http: anyProbe
+    });
+    checkTrue("a tapped refresh probed", tapped.httpCalls.length > 0);
+    checkTrue("it stored a ranking", !!tapped.store[K_RANK]);
+    checkTrue("it reports the chosen host",
+      tapped.donePayload.content.indexOf(shorten(JSON.parse(tapped.store[K_RANK]).ranking[0])) !== -1);
+    checkTrue("it reports a measured rate", tapped.donePayload.content.indexOf("Mbps") !== -1);
+    // Traffic has not been rewritten yet in this run, so it points at MitM.
+    check("style is info before any rewrite", tapped.donePayload.style, "info");
+    checkTrue("it points at the MitM switch",
+      tapped.donePayload.content.indexOf("MitM") !== -1);
+
+    // With rewrites on the record the panel turns green and shows the counters.
+    const reported = await runSurge({
+      script: { type: "generic" }, input: panelInput, trigger: "auto-interval",
+      argument: "mode=smart&notify=false",
+      store: Object.assign({}, rankStore, {
+        [K_STATS]: JSON.stringify({
+          responses: 9, rewrites: 27, liveDropped: 3,
+          last: { reason: "force-host", from: "upos-sz-mirrorcos.bilivideo.com", to: TARGET, at: clock.now },
+          lastNotifyAt: 0
+        })
+      }),
+      http: () => { throw new Error("reporting must not probe"); }
+    });
+    check("style is good once rewrites happen", reported.donePayload.style, "good");
+    checkTrue("it shows the counters", reported.donePayload.content.indexOf("命中 9 次 · 改写 27 处") !== -1);
+    checkTrue("it shows the last move", reported.donePayload.content.indexOf("最近 全量改写：sz-mirrorcos → tf-all-hw") !== -1);
+    checkTrue("it shows the live filtering", reported.donePayload.content.indexOf("直播剔除 3") !== -1);
+    check("no requests when only reporting", reported.httpCalls.length, 0);
+
+    // Traffic that needed no rewrite is a different situation from no traffic.
+    const noNeed = await runSurge({
+      script: { type: "generic" }, input: panelInput, trigger: "auto-interval",
+      argument: "mode=bad-only&notify=false",
+      store: Object.assign({}, rankStore, {
+        [K_STATS]: JSON.stringify({ responses: 4, rewrites: 0, liveDropped: 0, last: null, lastNotifyAt: 0 })
+      }),
+      http: () => { throw new Error("reporting must not probe"); }
+    });
+    check("style stays info when nothing needed rewriting", noNeed.donePayload.style, "info");
+    checkTrue("it explains that nothing needed rewriting",
+      noNeed.donePayload.content.indexOf("无需改写") !== -1);
+
+    const offPanel = await runSurge({
+      script: { type: "generic" }, input: panelInput, trigger: "button",
+      argument: "enabled=false",
+      http: () => { throw new Error("a disabled panel must not probe"); }
+    });
+    check("a disabled panel reports alert", offPanel.donePayload.style, "alert");
+    check("a disabled panel makes no requests", offPanel.httpCalls.length, 0);
+  }
+
+  // ---- 10. cron role, end to end ------------------------------------------
+
+  section("cron role");
+  {
+    const SPEEDS = {
+      "upos-sz-mirrorcosov.bilivideo.com": { status: 200, delay: 500 },
+      "upos-sz-mirroraliov.bilivideo.com": { status: 200, delay: 1100 },
+      "upos-sz-mirrorhwov.bilivideo.com": { status: 200, delay: 750 },
+      "upos-sz-mirrorali.bilivideo.com": { status: 200, delay: 400 },
+      "upos-tf-all-hw.bilivideo.com": { status: 200, delay: 100 },
+      "upos-sz-mirrorhw.bilivideo.com": { status: 200, delay: 250 },
+      "upos-sz-mirrorcos.bilivideo.com": { status: 200, delay: 600 },
+      "upos-tf-all-tx.bilivideo.com": { status: 200, delay: 900 }
+    };
+    const SEGMENT = "x".repeat(262144); // 256 KB of "video"
+
+    function responder(opts, overrides) {
+      if (opts.url.indexOf("/x/web-interface/popular") !== -1) {
+        return { status: 200, data: JSON.stringify({ data: { list: [{ bvid: "BV1abc", cid: 99 }] } }) };
+      }
+      if (opts.url.indexOf("/x/player/playurl") !== -1) {
+        return {
+          status: 200,
+          data: JSON.stringify({
+            data: { dash: { video: [{ baseUrl: "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&sign=abc" }] } }
+          })
+        };
+      }
+      const spec = (overrides && overrides[hostOf(opts.url)]) || SPEEDS[hostOf(opts.url)] || { status: 500, delay: 10 };
+      return {
+        status: spec.status,
+        delay: spec.delay,
+        data: opts.url.indexOf("/upgcxcode/") !== -1 ? SEGMENT : "<html>forbidden</html>"
+      };
+    }
+
+    // No ranking and no sample stored: the script has to bootstrap one from the
+    // public api, then rank the pool by measured throughput.
+    const boot = await runSurge({
+      script: { type: "cron" },
+      argument: "notify=true&debug=true",
+      http: (opts) => responder(opts)
+    });
+    check("cron finished once", boot.doneCount, 1);
+    checkTrue("a ranking was stored", !!boot.store[K_RANK]);
+    let rank = JSON.parse(boot.store[K_RANK] || "{}");
+    check("ranked via a signed sample", rank.via, "sample");
+    check("every pool host ranked", rank.ranking.length, 8);
+    check("fastest host first", rank.ranking[0], "upos-tf-all-hw.bilivideo.com");
+    check("slowest host last", rank.ranking[7], "upos-sz-mirroraliov.bilivideo.com");
+    checkTrue("a signed sample was cached", !!boot.store[K_SAMPLE]);
+    checkTrue("the bootstrap asked for a popular video",
+      boot.httpCalls.some((o) => o.url.indexOf("/x/web-interface/popular") !== -1));
+    const probeCall = boot.httpCalls.filter((o) => o.url.indexOf("/upgcxcode/") !== -1)[0];
+    checkTrue("a probe re-requested the signed segment", !!probeCall);
+    check("a probe asked for a bounded range", probeCall.headers.Range, "bytes=0-1048575");
+    check("a probe carried a referer", probeCall.headers.Referer, "https://www.bilibili.com/");
+    // $httpClient's timeout is in seconds. Milliseconds here would be accepted
+    // silently and hang the cron until Surge killed it.
+    checkTrue("every request used a seconds-scale timeout",
+      boot.httpCalls.every((o) => typeof o.timeout === "number" && o.timeout > 0 && o.timeout <= 30));
+    checkTrue("every pool host was probed",
+      api.CANDIDATE_POOL.every((h) => boot.httpCalls.some((o) => hostOf(o.url) === h)));
+    check("one notification", boot.notifications.length, 1);
+    checkTrue("the notification names the winner", boot.notifications[0][1].indexOf("tf-all-hw") !== -1);
+    // Debug narrates every measurement, including the hosts that lost.
+    check("every probe was logged",
+      boot.logs.filter((l) => l.indexOf("probe: upos-") !== -1).length, 8);
+    checkTrue("the winner's measured rate was logged",
+      boot.logs.some((l) => l.indexOf("probe: upos-tf-all-hw.bilivideo.com") !== -1 && l.indexOf("Mbps") !== -1));
+    check("debug lists the whole pool in the notification",
+      boot.notifications[0][2].split("\n").length, 8);
+
+    // A fresh ranking must cost nothing.
+    const fresh = await runSurge({
+      script: { type: "cron" },
+      argument: "notify=true",
+      store: { [K_RANK]: JSON.stringify({ at: clock.now, via: "sample", ranking: [TARGET], samples: [] }) },
+      http: () => { throw new Error("a fresh ranking must not probe"); }
+    });
+    check("a fresh ranking short-circuits", fresh.doneCount, 1);
+    check("no requests were made", fresh.httpCalls.length, 0);
+    check("the ranking was left alone", JSON.parse(fresh.store[K_RANK]).ranking[0], TARGET);
+
+    // The cached signature expired: every host rejects it. The module has to drop
+    // the sample and fall back to latency rather than store an empty ranking.
+    const forbidden = {};
+    api.CANDIDATE_POOL.forEach((h) => { forbidden[h] = { status: 403, delay: 50 }; });
+    const expired = await runSurge({
+      script: { type: "cron" },
+      argument: "notify=false",
+      store: {
+        [K_SAMPLE]: JSON.stringify({ at: clock.now, url: "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1/2/3.m4s?deadline=1&sign=abc" })
+      },
+      http: (opts) => responder(opts, forbidden)
+    });
+    check("cron finished once", expired.doneCount, 1);
+    check("the rejected sample was dropped", expired.store[K_SAMPLE], "");
+    rank = JSON.parse(expired.store[K_RANK] || "{}");
+    check("fell back to latency ranking", rank.via, "rtt");
+    check("the latency ranking covers the pool", rank.ranking.length, 8);
+    check("no notification when notify=false", expired.notifications.length, 0);
+    checkTrue("latency probed the bare host path",
+      expired.httpCalls.some((o) => o.url === "https://" + TARGET + "/"));
+    checkTrue("the sample round ran first", expired.httpCalls[0].url.indexOf("/upgcxcode/") !== -1);
+
+    // Total network failure must not wipe a usable ranking.
+    const dead = JSON.stringify({ at: 0, via: "sample", ranking: [TARGET], samples: [] });
+    const broke = await runSurge({
+      script: { type: "cron" },
+      argument: "notify=false",
+      store: { [K_RANK]: dead },
+      http: (opts) => (opts.url.indexOf("bilivideo") !== -1 ? { error: true } : responder(opts))
+    });
+    check("cron finished once when nothing answers", broke.doneCount, 1);
+    check("the previous ranking was kept", JSON.parse(broke.store[K_RANK]).ranking[0], TARGET);
+    check("the previous ranking was not restamped", JSON.parse(broke.store[K_RANK]).at, 0);
+
+    // A renamed or unexpected script type must still probe: appearing installed
+    // while doing nothing is the one failure mode that is invisible to the user.
+    const renamed = await runSurge({
+      script: { type: "panel" },
+      argument: "notify=false",
+      http: (opts) => responder(opts)
+    });
+    checkTrue("an unrecognized script type still probes", renamed.httpCalls.length > 0);
+    checkTrue("it stored a ranking", !!renamed.store[K_RANK]);
+
+    // Being attached as an http-request script would break browsing: Surge
+    // forbids async work before $done() in that context.
+    const asRequest = await runSurge({
+      script: { type: "http-request" },
+      request: { url: "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/1.m4s" },
+      argument: "notify=false",
+      http: () => { throw new Error("must not probe from an http-request script"); }
+    });
+    check("refuses to run as an http-request script", asRequest.doneCount, 1);
+    check("no requests from an http-request script", asRequest.httpCalls.length, 0);
+
+    const offRun = await runSurge({
+      script: { type: "cron" },
+      argument: "enabled=false",
+      http: () => { throw new Error("a disabled script must not probe"); }
+    });
+    check("a disabled cron finishes", offRun.doneCount, 1);
+    check("a disabled cron makes no requests", offRun.httpCalls.length, 0);
+  }
+
+  // ---- report -------------------------------------------------------------
+
+  render(true);
+  document.title = pass === (pass + failures.length) ? "PASS" : "FAIL";
+})();
+</script>
