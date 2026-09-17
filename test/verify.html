@@ -138,6 +138,7 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
       if (globals.request) window.$request = globals.request; else delete window.$request;
       if (globals.input) window.$input = globals.input; else delete window.$input;
       if (globals.trigger) window.$trigger = globals.trigger; else delete window.$trigger;
+      if (globals.utils) window.$utils = globals.utils; else delete window.$utils;
 
       try {
         window.eval(SOURCE);
@@ -238,6 +239,13 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     "https://api.bilibili.com/x/player/playurl?bvid=BV1&cid=1"
   ];
 
+  // 与参考实现**有意不同**的一处：上游把裸 IP 当 PCDN，那在浏览器里没问题（播放器有
+  // backup_url 与卡顿恢复兜底）；我们一旦判成劣质，换掉的是播放器正在用的那条 URL，
+  // 实测把 App 下发的 IP 形式 CDN 地址换成主机名后 403，整集放不出来 —— 所以裸 IP 不算劣质。
+  const REF_DEVIATIONS = [
+    "https://123.45.67.89/upgcxcode/1/2/3.m4s?deadline=1&sign=abc"
+  ];
+
   section("classification vs the reference userscript");
   {
     let ref = null;
@@ -269,6 +277,7 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
       const rank = { ranking: [TARGET] };
 
       for (const url of CORPUS) {
+        if (REF_DEVIATIONS.indexOf(url) !== -1) continue;
         const r = ref.classify(new URL(url), refCfg);
         const m = api.classify(api.parseUrl(url), myCfg);
         check("classify pcdn   " + url, m.pcdn, r.isPcdn);
@@ -284,7 +293,15 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
           check("rewrite tail   " + url, tailOf(myOut.url), tailOf(refOut.url));
         }
       }
-      note(CORPUS.length + " urls compared against the reference");
+      // 偏离项单独断言，避免它悄悄从对照里消失。
+      for (const url of REF_DEVIATIONS) {
+        const r = ref.classify(new URL(url), refCfg);
+        const m = api.classify(api.parseUrl(url), myCfg);
+        check("deviation: the reference treats a bare ip as pcdn   " + url, r.isPcdn, true);
+        check("deviation: we do not   " + url, m.pcdn, false);
+      }
+      note((CORPUS.length - REF_DEVIATIONS.length) + " urls compared against the reference, " +
+        REF_DEVIATIONS.length + " intentional deviation");
     }
   }
 
@@ -674,6 +691,18 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     const kept = await asRequest(backup, "mode=smart", Object.assign({}, rankStore));
     check("and leaves the backup candidate native too", kept.donePayload, {});
 
+    // 裸 IP 不是劣质节点：App 的 playurl 会下发 IP 形式的 CDN 地址（实测
+    // 203.121.59.225 = akam 边缘、92.223.116.254 = cosov 边缘，os= 正是 akam / cosovbv），
+    // 那是 App 自己 HTTPDNS 的结果。把它当 PCDN 改写成主机名 = 把能用的地址换成别处。
+    const IPS = "http://203.121.59.225/upgcxcode/17/75/41787787517/41787787517-1-30232.m4s?deadline=1&os=akam&upsig=abc&hdnts=exp=1~hmac=x";
+    const byIp = await asRequest(IPS, "mode=smart", Object.assign({}, rankStore));
+    check("a bare-ip segment is left alone in smart mode", byIp.donePayload, {});
+    const byIpForce = await asRequest(IPS, "mode=force", Object.assign({}, rankStore));
+    check("and in force mode too (an ip is not a bili cdn hostname)", byIpForce.donePayload, {});
+    check("a bare ip is not classified as pcdn",
+      api.classify(api.parseUrl(IPS), api.DEFAULTS).pcdn, false);
+    check("an ip-literal host is still recognised as a media url", api.hasMediaSignal(IPS), true);
+
     // 全量改写要显式 mode=force：这时播放器手里没有第二条地址，风险由用户承担。
     const forcedAkam = await asRequest(AKAM, "mode=force", Object.assign({}, rankStore));
     check("force mode does move the akamai segment", forcedAkam.donePayload.url,
@@ -898,6 +927,40 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     const f4 = api.rewriteGrpcBody(gzFrame, cfg, ranked, fresh());
     check("a compressed frame is left as is", f4.out, null);
     check("the compressed frame is counted", f4.compressed, 1);
+    check("and nothing was unzipped by default", f4.unzipped, 0);
+
+    // 官方 App 的 playurl 实测 100% 是 gzip 帧（5/5：2990B → 12476B），不解压就一次也
+    // 改不动。grpcGunzip 打开后：解压 → 改写 → 这一帧按"未压缩帧"（flag=0）发回去。
+    const gzPlain = mkBody(COSOV);
+    const gzCfg = Object.assign({}, cfgMove, { grpcGunzip: true });
+    window.$utils = { ungzip: () => gzPlain };
+    const f5s = fresh();
+    const f5 = api.rewriteGrpcBody(gzFrame, gzCfg, ranked, f5s);
+    check("with grpcGunzip the frame is rewritten", f5s.grpcRewrites, 1);
+    check("the rewritten frame is re-emitted uncompressed",
+      [f5.out[0], f5.frames, f5.unzipped], [0, 1, 1]);
+    check("its length prefix matches the decompressed message",
+      f5.out.length, 5 + gzPlain.length);
+    check("the uncompressed frame carries the new host",
+      stringsOf(f5.out.slice(5)), ["playurl-id", urlOf(ALIOV), "backup", "tail"]);
+
+    // 解压失败、或者 $utils 根本没有（老版本 Surge）时，帧必须原样保留。
+    window.$utils = { ungzip: () => null };
+    check("a failed ungzip leaves the frame alone",
+      api.rewriteGrpcBody(gzFrame, gzCfg, ranked, fresh()).out, null);
+    window.$utils = { ungzip: () => [1, 2, 3] };
+    check("an ungzip result that is not a message leaves the frame alone",
+      api.rewriteGrpcBody(gzFrame, gzCfg, ranked, fresh()).out, null);
+    delete window.$utils;
+    check("without $utils a compressed frame stays compressed",
+      api.rewriteGrpcBody(gzFrame, gzCfg, ranked, fresh()).out, null);
+
+    // 裸 IP 在字节层同样不换：App 下发 IP 形式的 CDN 地址时，换成主机名会 403。
+    const ipBody = new Uint8Array([].concat(
+      sfield(1, "playurl-id"),
+      sfield(2, "http://203.121.59.225/upgcxcode/1/2/3.m4s?deadline=1&os=akam&upsig=abc")));
+    check("a bare-ip url inside a protobuf body is untouched",
+      api.rewriteProto(ipBody, cfg, ranked, fresh()), null);
 
     check("a truncated frame stream is not touched",
       api.rewriteGrpcBody(new Uint8Array([].concat(frame(Array.from(mkBody(COSOV))), [0, 0, 0])),
