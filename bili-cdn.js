@@ -11,7 +11,7 @@
   var K_STATS = "bili_fast_cdn.stats.v1";
 
   // Surge 对远程脚本默认缓存 86400 秒，面板标题带版本号才能确认设备上跑的是哪一版。
-  var VERSION = "0.4.0";
+  var VERSION = "0.5.0";
   var PANEL_TITLE = "B站CDN";
   var REASON_LABELS = {
     "force-host": "全量改写",
@@ -52,6 +52,8 @@
     hostOversea: "auto",
     hostBStar: "auto",
     hostMcdn: MCDN_PROXY_HOST,
+    // akam：填主机名就总是换到它（无论 rewriteAkamai 开关），留 auto 则不动。
+    hostAkamai: "auto",
     liveFilter: true,
     backupFanout: true,
     rewriteAkamai: false,
@@ -82,6 +84,7 @@
     host_oversea: "hostOversea",
     host_bstar: "hostBStar",
     host_mcdn: "hostMcdn",
+    host_akamai: "hostAkamai",
     live_filter: "liveFilter",
     mcdn_strategy: "mcdnStrategy",
     port_heuristic: "portHeuristic",
@@ -198,6 +201,7 @@
     cfg.hostOversea = asHost(cfg.hostOversea, DEFAULTS.hostOversea);
     cfg.hostBStar = asHost(cfg.hostBStar, DEFAULTS.hostBStar);
     cfg.hostMcdn = asHost(cfg.hostMcdn, DEFAULTS.hostMcdn);
+    cfg.hostAkamai = asHost(cfg.hostAkamai, DEFAULTS.hostAkamai);
     cfg.rewriteAkamai = asBool(cfg.rewriteAkamai, DEFAULTS.rewriteAkamai);
     cfg.portHeuristic = asBool(cfg.portHeuristic, DEFAULTS.portHeuristic);
     cfg.rankTtlMs = asNumber(cfg.rankTtlMs, DEFAULTS.rankTtlMs);
@@ -406,6 +410,9 @@
   // *bstar1 属国际版，其余按大陆处理。
   function categoryOf(host) {
     var h = cleanHost(host);
+    // Akamai 单独一类：他在马来西亚实测效果差，需要「把 akam 换掉」这个独立开关，
+    // 而不是并进 hostPcdn。
+    if (/\.akamaized\.net$/i.test(h)) return "akamai";
     if (h.indexOf("upos-sz-mirror") === 0 && /ov\.bilivideo\.com$/.test(h)) return "oversea";
     if (h.indexOf("cn-hk-eq-") === 0 && /\.bilivideo\.com$/.test(h)) return "oversea";
     if (/bstar1\.bilivideo\.com$/.test(h)) return "bstar";
@@ -415,8 +422,9 @@
   // 用户手填的分类固定目标，auto 表示没填（那就用测速排名）。
   function pinnedFor(cfg, host) {
     var category = categoryOf(host);
-    var override = category === "oversea" ? cfg.hostOversea
-      : (category === "bstar" ? cfg.hostBStar : cfg.hostPcdn);
+    var override = category === "akamai" ? cfg.hostAkamai
+      : (category === "oversea" ? cfg.hostOversea
+      : (category === "bstar" ? cfg.hostBStar : cfg.hostPcdn));
     return override && override !== "auto" ? override : null;
   }
 
@@ -463,7 +471,8 @@
       return moved(swapHost(rawUrl, target, p.scheme), p.host, target, "mcdn-host");
     }
     if (v.pcdn) return moved(swapHost(rawUrl, target, p.scheme), p.host, target, "pcdn-host");
-    if (cfg.rewriteAkamai && v.akamai) {
+    // akam 换不换：rewriteAkamai 是总开关，hostAkamai 填了主机名就等于显式指定目标。
+    if (v.akamai && (cfg.rewriteAkamai || pinnedFor(cfg, p.host))) {
       return moved(swapHost(rawUrl, target, p.scheme), p.host, target, "akamai-host");
     }
 
@@ -1134,7 +1143,8 @@
     if (isMcdnHost(host) && cfg.mcdnStrategy !== "off") return true;
     // 裸 IP 不换：那是 App 用 HTTPDNS 拿到的 CDN 边缘地址，不是 P2P 节点，判据同 classify。
     if (isKnownP2pHost(host) || XY_MCDN_RE.test(host)) return true;
-    if (/\.akamaized\.net$/i.test(host)) return cfg.rewriteAkamai;
+    // akam：总开关开着就换；给 hostAkamai 填了目标也换（不然会在这里提前返回 false）。
+    if (/\.akamaized\.net$/i.test(host)) return cfg.rewriteAkamai || !!pinnedFor(cfg, host);
     // 用户明确指定了该分类的目标（不是 auto）时，健康节点也照换 —— 那是显式意图。
     if (pinnedFor(cfg, host)) return true;
     return false;
