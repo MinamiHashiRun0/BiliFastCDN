@@ -254,6 +254,14 @@
 
 ---
 
+## 参考（未使用其代码）
+
+- **CCB（Custom CDN of Bilibili）** —— https://greasyfork.org/scripts/527498 ，作者 鼠鼠今天吃嘉然，
+  许可 MIT。测速候选池里的香港节点（`cn-hk-eq-01-*` 与 `cn-hk-eq-bcache-13`）取自它公开的节点
+  列表（`kanda-akihito-kun.github.io/ccb/api/cdn.json`）。只用到主机名这一事实性数据，未复制代码。
+
+---
+
 ## bilibili-accelerator（历史署名，v1.0.0 起不再使用其代码）
 
 - 仓库：https://github.com/realzza/bilibili-accelerator

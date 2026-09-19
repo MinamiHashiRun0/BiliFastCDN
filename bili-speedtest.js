@@ -6,13 +6,15 @@
   "use strict";
 
   var TAG = "[BiliFastCDN] ";
-  var VERSION = "1.1.0";
+  var VERSION = "1.1.1";
 
   var K_RANK = "bili_fast_cdn.rank.v2";
   var K_SAMPLE = "bili_fast_cdn.sample.v1";
   var K_STATS = "bili_fast_cdn.stats.v1";
 
   // 候选池：海外镜像优先。Akamai 不列入 —— 它对 upos 签名路径返回 403，测不出结果。
+  // 香港那组 `cn-hk-eq-*` 取自 CCB（Custom CDN of Bilibili）的公开节点列表，对马来西亚这类
+  // 东南亚网络通常比大陆节点近；它们和 akam/*ov 同属"港澳台"分类，赢了排名就会被选为目标。
   var CANDIDATE_POOL = [
     "upos-sz-mirrorcosov.bilivideo.com",
     "upos-sz-mirroraliov.bilivideo.com",
@@ -21,7 +23,15 @@
     "upos-tf-all-hw.bilivideo.com",
     "upos-sz-mirrorhw.bilivideo.com",
     "upos-sz-mirrorcos.bilivideo.com",
-    "upos-tf-all-tx.bilivideo.com"
+    "upos-tf-all-tx.bilivideo.com",
+    "cn-hk-eq-01-01.bilivideo.com",
+    "cn-hk-eq-01-03.bilivideo.com",
+    "cn-hk-eq-01-09.bilivideo.com",
+    "cn-hk-eq-01-10.bilivideo.com",
+    "cn-hk-eq-01-12.bilivideo.com",
+    "cn-hk-eq-01-13.bilivideo.com",
+    "cn-hk-eq-01-14.bilivideo.com",
+    "cn-hk-eq-bcache-13.bilivideo.com"
   ];
   var DEFAULT_HOST = "upos-sz-mirrorcosov.bilivideo.com";
 
