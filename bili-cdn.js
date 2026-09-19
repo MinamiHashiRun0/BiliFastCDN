@@ -7,7 +7,7 @@
   "use strict";
 
   var TAG = "[BiliFastCDN] ";
-  var VERSION = "1.1.1";
+  var VERSION = "1.1.2";
   var K_RANK = "bili_fast_cdn.rank.v2";
   var K_STATS = "bili_fast_cdn.stats.v1";
 
@@ -21,6 +21,7 @@
     hostBStar: AUTO,
     hostPcdn: AUTO,
     hostMcdn: MCDN_PROXY_HOST,
+    preferHk: false,
     debug: false
   };
 
@@ -29,7 +30,8 @@
     host_oversea: "hostOverseaVideo",
     host_bstar: "hostBStar",
     host_pcdn: "hostPcdn",
-    host_mcdn: "hostMcdn"
+    host_mcdn: "hostMcdn",
+    prefer_hk: "preferHk"
   };
 
   // 来源主机名分组，逐条照搬 Redirect 的 switch。
@@ -150,6 +152,7 @@
     cfg.hostBStar = asTarget(cfg.hostBStar, DEFAULTS.hostBStar);
     cfg.hostPcdn = asTarget(cfg.hostPcdn, DEFAULTS.hostPcdn);
     cfg.hostMcdn = asTarget(cfg.hostMcdn, DEFAULTS.hostMcdn);
+    cfg.preferHk = asBool(cfg.preferHk, DEFAULTS.preferHk);
     cfg.debug = asBool(cfg.debug, DEFAULTS.debug);
     return cfg;
   }
@@ -167,12 +170,24 @@
     return hosts.length ? { at: j.at || 0, ranking: hosts } : null;
   }
 
-  // 分类目标：填了固定主机就用它；auto 用测速第一；还没测速就落到兜底主机。
+  // 香港那组 cn-hk-eq-* 与 *ov 同属"港澳台"分类，但对东南亚网络通常更近，所以另给一个开关。
+  function isHkHost(host) {
+    return /^cn-hk-eq-/.test(String(host == null ? "" : host));
+  }
+
+  // 分类目标：填了固定主机就用它；auto 用测速排名 —— 开了 preferHk 就取排名里第一个香港节点，
+  // 这一轮没有香港节点通过测速（压根不在排名里）时自然退回全场第一；还没测速就落到兜底主机。
   function resolveTarget(cfg, key) {
     var value = cfg[key];
     if (value && value !== AUTO) return value;
     var rank = loadRank();
-    return rank ? rank.ranking[0] : BOOTSTRAP_HOST;
+    if (!rank) return BOOTSTRAP_HOST;
+    if (cfg.preferHk) {
+      for (var i = 0; i < rank.ranking.length; i++) {
+        if (isHkHost(rank.ranking[i])) return rank.ranking[i];
+      }
+    }
+    return rank.ranking[0];
   }
 
   // ---- URL ------------------------------------------------------------------
@@ -370,6 +385,7 @@
       parseArgument: parseArgument,
       loadConfig: loadConfig,
       loadRank: loadRank,
+      isHkHost: isHkHost,
       resolveTarget: resolveTarget,
       parseUrl: parseUrl,
       buildUrl: buildUrl,

@@ -10,7 +10,7 @@
   "use strict";
 
   var TAG = "[BiliFastCDN] ";
-  var VERSION = "1.1.1";
+  var VERSION = "1.1.2";
   var K_RANK = "bili_fast_cdn.rank.v2";
   var K_STATS = "bili_fast_cdn.stats.v1";
   var K_SAMPLE = "bili_fast_cdn.sample.v1";
@@ -25,6 +25,7 @@
     hostBStar: AUTO,
     hostPcdn: AUTO,
     hostMcdn: MCDN_PROXY_HOST,
+    preferHk: false,
     debug: false
   };
 
@@ -33,7 +34,8 @@
     host_oversea: "hostOverseaVideo",
     host_bstar: "hostBStar",
     host_pcdn: "hostPcdn",
-    host_mcdn: "hostMcdn"
+    host_mcdn: "hostMcdn",
+    prefer_hk: "preferHk"
   };
 
   var MAINLAND_MIRRORS = [
@@ -142,6 +144,7 @@
     cfg.hostBStar = cleanHost(cfg.hostBStar) || DEFAULTS.hostBStar;
     cfg.hostPcdn = cleanHost(cfg.hostPcdn) || DEFAULTS.hostPcdn;
     cfg.hostMcdn = cleanHost(cfg.hostMcdn) || DEFAULTS.hostMcdn;
+    cfg.preferHk = asBool(cfg.preferHk, DEFAULTS.preferHk);
     cfg.debug = asBool(cfg.debug, DEFAULTS.debug);
     return cfg;
   }
@@ -159,11 +162,22 @@
     return hosts.length ? { at: j.at || 0, ranking: hosts } : null;
   }
 
+  // 与请求侧同一条规则：开了 preferHk 就取排名里第一个香港节点，没有就退回全场第一。
+  function isHkHost(host) {
+    return /^cn-hk-eq-/.test(String(host == null ? "" : host));
+  }
+
   function resolveTarget(cfg, key) {
     var value = cfg[key];
     if (value && value !== AUTO) return value;
     var rank = loadRank();
-    return rank ? rank.ranking[0] : BOOTSTRAP_HOST;
+    if (!rank) return BOOTSTRAP_HOST;
+    if (cfg.preferHk) {
+      for (var i = 0; i < rank.ranking.length; i++) {
+        if (isHkHost(rank.ranking[i])) return rank.ranking[i];
+      }
+    }
+    return rank.ranking[0];
   }
 
   // ---- URL ------------------------------------------------------------------
@@ -628,6 +642,7 @@
       parseArgument: parseArgument,
       loadConfig: loadConfig,
       loadRank: loadRank,
+      isHkHost: isHkHost,
       resolveTarget: resolveTarget,
       parseUrl: parseUrl,
       buildUrl: buildUrl,
