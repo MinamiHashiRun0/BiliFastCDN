@@ -214,6 +214,58 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     check("with hostPcdn pinned, a mainland mirror stays put (upstream semantics)", pinnedPcdn.donePayload, {});
   }
 
+  // ---- 3b. preferHk -------------------------------------------------------
+
+  section("preferHk");
+  {
+    const HK = "cn-hk-eq-01-01.bilivideo.com";
+    const store = rankStore([RANK_A, HK, "upos-sz-mirrorcosov.bilivideo.com"]);
+    check("the switch is off by default on both sides",
+      [req.DEFAULTS.preferHk, pl.DEFAULTS.preferHk], [false, false]);
+
+    const off = await asRequest("http://upos-hz-mirrorakam.akamaized.net/upgcxcode/x", "", Object.assign({}, store));
+    check("off: the fastest host is still the target", hostOf(off.donePayload.url), RANK_A);
+
+    const on = await asRequest("http://upos-hz-mirrorakam.akamaized.net/upgcxcode/x", "preferHk=true",
+      Object.assign({}, store));
+    check("on: the Hong Kong node wins even though it is not the fastest",
+      hostOf(on.donePayload.url), HK);
+
+    const onMirror = await asRequest("http://upos-tf-all-tx.bilivideo.com/upgcxcode/x", "preferHk=true",
+      Object.assign({}, store));
+    check("on: the mainland category follows it too", hostOf(onMirror.donePayload.url), HK);
+
+    const alias = await asRequest("http://upos-hz-mirrorakam.akamaized.net/upgcxcode/x", "prefer_hk=true",
+      Object.assign({}, store));
+    check("the snake_case alias reaches the same field", hostOf(alias.donePayload.url), HK);
+
+    const pinned = await asRequest("http://upos-hz-mirrorakam.akamaized.net/upgcxcode/x",
+      "preferHk=true&hostOverseaVideo=upos-sz-mirrorhw.bilivideo.com", Object.assign({}, store));
+    check("a pinned host still beats the Hong Kong preference",
+      hostOf(pinned.donePayload.url), "upos-sz-mirrorhw.bilivideo.com");
+
+    const noHk = await asRequest("http://upos-hz-mirrorakam.akamaized.net/upgcxcode/x", "preferHk=true",
+      rankStore([RANK_A, "upos-sz-mirrorcosov.bilivideo.com"]));
+    check("on but no Hong Kong node ranked: falls back to the overall fastest",
+      hostOf(noHk.donePayload.url), RANK_A);
+
+    const resSide = await asResponse("https://api.bilibili.com/pgc/player/web/playurl?x=1",
+      JSON.stringify({ data: { dash: { video: [{ baseUrl: "http://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/1.m4s" }] } } }),
+      "preferHk=true", Object.assign({}, store));
+    check("the response side picks the Hong Kong node as well",
+      hostOf(JSON.parse(resSide.donePayload.body).data.dash.video[0].baseUrl), HK);
+
+    check("isHkHost matches the Equinix group and nothing else",
+      [probe.isHkHost(HK), probe.isHkHost("upos-sz-mirrorcosov.bilivideo.com"), probe.isHkHost("")],
+      [true, false, false]);
+    check("targetIndex points at the Hong Kong node",
+      probe.targetIndex({ preferHk: true }, { ranking: ["a.bilivideo.com", HK] }), 1);
+    check("targetIndex stays at the top without the switch",
+      probe.targetIndex({ preferHk: false }, { ranking: ["a.bilivideo.com", HK] }), 0);
+    check("targetIndex stays at the top when no Hong Kong node ranked",
+      probe.targetIndex({ preferHk: true }, { ranking: ["a.bilivideo.com"] }), 0);
+  }
+
   // ---- 4. MCDN / PCDN port matrix -----------------------------------------
 
   section("MCDN / PCDN");
@@ -439,6 +491,30 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     checkTrue("it shows the counters", stored.donePayload.content.indexOf("命中12 改写5") !== -1);
     checkTrue("it shows the last move", stored.donePayload.content.indexOf("最近 港澳台：") !== -1);
     check("style is good once rewrites happened", stored.donePayload.style, "good");
+    checkTrue("without the switch the card keeps saying 最快",
+      stored.donePayload.content.indexOf("港优先") === -1);
+
+    const hkPanel = await asPanel("notify=false&preferHk=true", rankStore([RANK_A, "cn-hk-eq-01-01.bilivideo.com"], {
+      samples: [{ host: RANK_A, mbps: 40, ms: 80 }, { host: "cn-hk-eq-01-01.bilivideo.com", mbps: 12, ms: 60 }]
+    }));
+    checkTrue("the card leads with the Hong Kong target",
+      hkPanel.donePayload.content.indexOf("港优先 cn-hk-eq-01-01") !== -1);
+    checkTrue("the rate shown belongs to that node, not to the fastest",
+      hkPanel.donePayload.content.indexOf("12.0 Mbps") !== -1);
+    checkTrue("and the overall fastest is still visible",
+      hkPanel.donePayload.content.indexOf("全场最快 tf-all-hw") !== -1);
+
+    const hkNone = await asPanel("notify=false&preferHk=true",
+      rankStore([RANK_A, "upos-sz-mirrorcosov.bilivideo.com"]));
+    checkTrue("with no Hong Kong node ranked the card says so",
+      hkNone.donePayload.content.indexOf("本轮无香港节点通过测速") !== -1);
+
+    // 测速那一轮的通知也要说清"发给了谁"：标题是被选中的目标，正文第一行仍是全场最快。
+    const notified = await runSurge(SRC_PROBE, { argument: "notify=true&preferHk=true", store: {}, http: anyProbe });
+    check("the probe announces the Hong Kong target when the switch is on",
+      notified.notifications[0][1], "港优先 cn-hk-eq-01-01");
+    checkTrue("the body still lists the overall fastest first",
+      notified.notifications[0][2].indexOf("sz-mirrorcosov") !== -1);
 
     const tapped = await asPanel("notify=false", {}, "button", anyProbe);
     checkTrue("tapping refresh probes", tapped.httpCalls.length > 0);
@@ -482,6 +558,19 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
     checkTrue("it passes the four targets to the script",
       ["hostOverseaVideo", "hostBStar", "hostPcdn", "hostMcdn"]
         .every((k) => MOD_REQUEST.indexOf(k + "={{{" + k + "}}}") !== -1));
+
+    // 香港优先开关：两个模块的参数字典都要有它，而且每一个脚本条目都要收到它 ——
+    // 面板要按它换第一行，两个后端要按它挑目标，漏传哪一个都会让"开了但没反应"。
+    checkTrue("both modules declare the Hong Kong switch (default off)",
+      /#!arguments=[^\n]*preferHk:false/.test(MOD_REQUEST) &&
+      /#!arguments=[^\n]*preferHk:false/.test(MOD_PLAYURL));
+    checkTrue("both explain it in the parameter table",
+      /#!arguments-desc=[^\n]*preferHk:/.test(MOD_REQUEST) &&
+      /#!arguments-desc=[^\n]*preferHk:/.test(MOD_PLAYURL));
+    check("the request module passes it to all three scripts",
+      MOD_REQUEST.split("preferHk={{{preferHk}}}").length - 1, 3);
+    check("the playurl module passes it to all six scripts",
+      MOD_PLAYURL.split("preferHk={{{preferHk}}}").length - 1, 6);
 
     ["PlayViewUnite", "PlayURL/PlayView", "pgc/player/(api|web)/playurl", "pgc/player/web/v2/playurl"]
       .forEach((token) => {

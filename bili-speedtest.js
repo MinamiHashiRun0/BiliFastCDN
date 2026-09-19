@@ -6,7 +6,7 @@
   "use strict";
 
   var TAG = "[BiliFastCDN] ";
-  var VERSION = "1.1.1";
+  var VERSION = "1.1.2";
 
   var K_RANK = "bili_fast_cdn.rank.v2";
   var K_SAMPLE = "bili_fast_cdn.sample.v1";
@@ -38,6 +38,9 @@
   var DEFAULTS = {
     notify: true,
     debug: false,
+    // 测速本身照旧测全池、排名照旧按实测排序；这个开关只影响"从排名里挑谁当目标"。
+    // 所以打开它不会让测速变慢或变味，面板上仍然能看到全场最快是谁。
+    preferHk: false,
     rankTtlMs: 6 * 60 * 60 * 1000,
     sampleTtlMs: 90 * 60 * 1000,
     // 注意单位：Surge $httpClient 的 timeout 是秒，其余 TTL 是毫秒。
@@ -115,6 +118,7 @@
     }
     cfg.notify = asBool(cfg.notify, DEFAULTS.notify);
     cfg.debug = asBool(cfg.debug, DEFAULTS.debug);
+    cfg.preferHk = asBool(cfg.preferHk, DEFAULTS.preferHk);
     cfg.rankTtlMs = asNumber(cfg.rankTtlMs, DEFAULTS.rankTtlMs);
     cfg.sampleTtlMs = asNumber(cfg.sampleTtlMs, DEFAULTS.sampleTtlMs);
     cfg.probeTimeout = asNumber(cfg.probeTimeout, DEFAULTS.probeTimeout);
@@ -177,9 +181,25 @@
     };
   }
 
-  function bestHost() {
-    var rank = loadRank(loadConfig());
-    return rank ? rank.ranking[0] : DEFAULT_HOST;
+  function isHkHost(host) {
+    return /^cn-hk-eq-/.test(String(host == null ? "" : host));
+  }
+
+  // 排名里第一个香港节点；一个都没有就返回 null。
+  function firstHk(ranking) {
+    for (var i = 0; i < ranking.length; i++) {
+      if (isHkHost(ranking[i])) return ranking[i];
+    }
+    return null;
+  }
+
+  // 两个后端按同一条规则挑目标：开了 preferHk 取排名里第一个香港节点，否则取排名第一。
+  // 这里算出下标（而不是重新挑一次），面板才能显示被挑中那个节点自己的实测速率。
+  // 香港节点全被这一轮测速否掉时它不在排名里，于是自然退回全场第一，不用额外兜底。
+  function targetIndex(cfg, rank) {
+    if (!cfg.preferHk) return 0;
+    var hk = firstHk(rank.ranking);
+    return hk ? rank.ranking.indexOf(hk) : 0;
   }
 
   // ---- 测速 -----------------------------------------------------------------
@@ -318,11 +338,19 @@
   function notifyBest(ranked, via, cfg) {
     var limit = cfg.debug ? ranked.length : 3;
     var lines = [];
-    for (var i = 0; i < ranked.length && i < limit; i++) {
-      lines.push(shorten(ranked[i].host) + " " + ranked[i].mbps.toFixed(1) + " Mbps / " + ranked[i].ms + "ms");
+    var hk = null;
+    for (var i = 0; i < ranked.length; i++) {
+      if (cfg.preferHk && !hk && isHkHost(ranked[i].host)) hk = ranked[i].host;
+      if (i < limit) {
+        lines.push(shorten(ranked[i].host) + " " + ranked[i].mbps.toFixed(1) + " Mbps / " + ranked[i].ms + "ms");
+      }
     }
     if (via !== "sample") lines.push("仅延迟测速：播放一次视频后会自动做吞吐测速");
-    try { $notification.post("BiliFastCDN 测速完成", "最快 " + shorten(ranked[0].host), lines.join("\n")); } catch (e) {}
+    // 开了香港优先时，通知标题给的是实际会被用作目标的那个节点，正文里的第一行仍是全场最快。
+    if (hk && hk !== ranked[0].host) lines.push("港优先，目标 " + shorten(hk) + "；上面第一行是全场最快");
+    var target = cfg.preferHk && hk ? hk : ranked[0].host;
+    var label = target === ranked[0].host ? "最快 " : "港优先 ";
+    try { $notification.post("BiliFastCDN 测速完成", label + shorten(target), lines.join("\n")); } catch (e) {}
   }
 
   function probeRound(cfg, cb) {
@@ -413,15 +441,23 @@
       var style = "info";
 
       if (rank && rank.ranking.length) {
-        var best = rank.samples && rank.samples.length ? rank.samples[0] : null;
-        var rate = best && best.mbps ? best.mbps.toFixed(1) + " Mbps" : (best ? "延迟 " + best.ms + "ms" : "");
+        var idx = targetIndex(cfg, rank);
+        var pick = rank.ranking[idx];
+        var sample = rank.samples && rank.samples[idx] ? rank.samples[idx] : null;
+        var rate = sample && sample.mbps ? sample.mbps.toFixed(1) + " Mbps" : (sample ? "延迟 " + sample.ms + "ms" : "");
         var ageMin = Math.round((Date.now() - rank.at) / 60000);
-        lines.push("最快 " + shorten(rank.ranking[0]) + (rate ? " · " + rate : ""));
+        // 第一行必须是"实际会被用作目标的那一个"，不是全场最快 —— 开了香港优先时两者可以不同。
+        lines.push((idx > 0 ? "港优先 " : "最快 ") + shorten(pick) + (rate ? " · " + rate : ""));
         lines.push("测速 " + (ageMin < 1 ? "刚刚" : ageMin + " 分钟前") + " · " + rank.ranking.length + " 个节点" +
           rejectedTail(rank.rejected));
+        if (idx > 0) lines.push("全场最快 " + shorten(rank.ranking[0]));
+        // 开了香港优先但这一轮没有香港节点通过测速：得在卡片上说出来，否则用户会以为开关没生效。
+        else if (cfg.preferHk && !isHkHost(pick)) {
+          lines.push("港优先：本轮无香港节点通过测速（" + shorten(pick) + " 是全场最快）");
+        }
       } else {
         lines.push(shorten(DEFAULT_HOST) + "（兜底，尚未测速）");
-        lines.push("点刷新按钮立即测速");
+        lines.push(cfg.preferHk ? "点刷新按钮立即测速 · 香港优先已开" : "点刷新按钮立即测速");
       }
 
       lines.push("改写 命中" + state.calls + " 改写" + state.rewrites);
@@ -469,6 +505,9 @@
       swapHost: swapHost,
       throughputMbps: throughputMbps,
       rankSamples: rankSamples,
+      isHkHost: isHkHost,
+      firstHk: firstHk,
+      targetIndex: targetIndex,
       loadRank: loadRank,
       saveRank: saveRank,
       loadSample: loadSample,
