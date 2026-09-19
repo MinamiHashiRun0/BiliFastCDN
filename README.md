@@ -46,12 +46,16 @@ Surge iOS 模块：把 B 站下发的 CDN 请求换到**自动测速选出的最
 
 **1. 测速与排名（cron，默认 30 分钟检查一次，结果满 6 小时才重测）**
 
-用真实签名分片做 `Range` 请求（恰好 1MB）测吞吐，候选池是 8 个 upos 镜像：
+用真实签名分片做 `Range` 请求（恰好 1MB）测吞吐。候选池 16 个节点：8 个 upos 镜像 + 8 个香港节点。
 
 ```
 upos-sz-mirrorcosov / upos-sz-mirroraliov / upos-sz-mirrorhwov / upos-sz-mirrorali
 upos-tf-all-hw / upos-sz-mirrorhw / upos-sz-mirrorcos / upos-tf-all-tx
+cn-hk-eq-01-01 / -01-03 / -01-09 / -01-10 / -01-12 / -01-13 / -01-14 / -bcache-13
 ```
+
+香港那组取自 [CCB（Custom CDN of Bilibili）](https://greasyfork.org/scripts/527498) 的公开节点列表 ——
+对东南亚网络通常比大陆节点近；它们与 Akamai/`*ov` 同属"港澳台"分类，赢了排名就会被选为目标。
 
 Akamai 不列入候选池：它对 upos 签名路径返回 403，测不出结果。
 样本优先用响应侧模块抓到的真实分片地址；没有就去公开接口引导一个。淘汰的候选（403/超时/HTML 错误页）
@@ -63,7 +67,7 @@ Akamai 不列入候选池：它对 upos 签名路径返回 403，测不出结果
 
 | 参数 | 覆盖的来源 | `auto` 时的取值 |
 | --- | --- | --- |
-| `hostOverseaVideo` | 港澳台（`*ov`、`cn-hk-eq-*`）与 Akamai | 测速第一 |
+| `hostOverseaVideo` | 港澳台（`*ov`、`cn-hk-eq-*`，含香港节点）与 Akamai | 测速第一 |
 | `hostBStar` | 国际版（`*bstar1`） | 测速第一 |
 | `hostPcdn` | 其余镜像、PCDN 回原节点 | 测速第一 |
 | `hostMcdn` | MCDN（`:4483`/`:9102` 代理包裹） | 固定（不参与测速） |
@@ -93,7 +97,7 @@ Surge 只有 ungzip、没有 gzip，压不回去。
 | `BiliFastCDN.sgmodule` | 请求侧模块 |
 | `BiliFastCDN.PlayURL.sgmodule` | 响应侧模块 |
 | `bili-cdn.js` / `bili-playurl.js` / `bili-speedtest.js` | 三个脚本 |
-| `test/verify.html` | 离线验证套件，110 项断言，用浏览器跑 |
+| `test/verify.html` | 离线验证套件，116 项断言，用浏览器跑 |
 | `LICENSE` / `THIRD-PARTY-NOTICES.md` | MIT（自身） / 上游 Apache-2.0 全文与变更说明 |
 
 **发版时版本号要改两处**：`#!desc` 与各 `script-path` 的 `?v=`（两个模块都要），三个脚本的 `VERSION`
@@ -146,7 +150,7 @@ chrome --headless=new --disable-gpu --allow-file-access-from-files \
        --virtual-time-budget=25000 --dump-dom test/verify.html
 ```
 
-输出 `ALL n CHECKS PASSED` 或失败明细。110 项断言覆盖：
+输出 `ALL n CHECKS PASSED` 或失败明细。116 项断言覆盖：
 
 - URL 原语、参数解析（含 `xy_usource` 的百分号解码）、粘贴整条 URL 时只取主机名
 - `auto`：有排名时收敛到第一、无排名时回落兜底主机、固定主机名压过排名、`hostPcdn` 固定时大陆镜像放过
@@ -156,7 +160,8 @@ chrome --headless=new --disable-gpu --allow-file-access-from-files \
 - 响应侧 JSON：`baseUrl`/`backupUrl`/`durl` 一起改、已在目标上则逐字节放过、无媒体地址则放过并只计一次调用
 - 响应侧 gRPC：等长/变长替换、帧长度前缀重算、压缩帧在无 `$utils` 时原样放过、有 `$utils` 时解压改写
   并按未压缩帧发回、非帧结构放过
-- 测速：候选池不含 Akamai、排序（吞吐优先、同速看延迟）、样本挑选跳过 mcdn、面板文案与样式、
+- 测速：候选池 16 个节点且含 8 个香港节点、不含 Akamai、排序（吞吐优先、同速看延迟）、
+  香港节点赢下排名后请求侧与响应侧都会用它、样本挑选跳过 mcdn、面板文案与样式、
   点刷新会真的发探测且超时是秒级
 - **两个模块与脚本的一致性**：条数、版本号三处一致、cron/面板指向 `bili-speedtest.js`、
   响应侧四条 pattern 与 `binary-body-mode`/`engine=webview`、旧引擎参数已清干净

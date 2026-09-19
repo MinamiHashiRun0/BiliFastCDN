@@ -387,9 +387,26 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
 
   section("speed test and panel");
   {
-    check("the pool is the upos mirror list", probe.CANDIDATE_POOL.length, 8);
+    check("the pool is the upos mirror list plus the Hong Kong nodes", probe.CANDIDATE_POOL.length, 16);
     check("akam is not in the pool (it 403s upos-signed samples)",
       probe.CANDIDATE_POOL.some((h) => /akamaized/.test(h)), false);
+    check("the Hong Kong Equinix nodes are in the pool",
+      probe.CANDIDATE_POOL.filter((h) => /^cn-hk-eq-/.test(h)).length, 8);
+    checkTrue("every pool host is a plain hostname",
+      probe.CANDIDATE_POOL.every((h) => /^[a-z0-9.-]+$/.test(h)));
+
+    // 香港节点与 akam/*ov 同属"港澳台"分类：赢了排名就会被选为目标。
+    const hkStore = rankStore(["cn-hk-eq-01-01.bilivideo.com"]);
+    const hkAkam = await asRequest("http://upos-hz-mirrorakam.akamaized.net/upgcxcode/x", "", Object.assign({}, hkStore));
+    check("a Hong Kong node can win and be used as the target",
+      hostOf(hkAkam.donePayload.url), "cn-hk-eq-01-01.bilivideo.com");
+    const hkOv = await asRequest("http://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/x", "", Object.assign({}, hkStore));
+    check("an *ov host follows it too", hostOf(hkOv.donePayload.url), "cn-hk-eq-01-01.bilivideo.com");
+    const hkPgc = await asResponse("https://api.bilibili.com/pgc/player/web/playurl?x=1",
+      JSON.stringify({ data: { dash: { video: [{ baseUrl: "http://cn-hk-eq-01-09.bilivideo.com/upgcxcode/1.m4s" }] } } }),
+      "", rankStore([RANK_A]));
+    check("on the response side a Hong Kong source moves to the fastest",
+      hostOf(JSON.parse(hkPgc.donePayload.body).data.dash.video[0].baseUrl), RANK_A);
 
     const ranked = probe.rankSamples([
       { host: "a", ok: true, mbps: 10, ms: 100 },
@@ -457,9 +474,11 @@ window.addEventListener("unhandledrejection", (e) => fail((e.reason && e.reason.
       /BiliFastCDN-CDN = type=http-request[\s\S]*bili-cdn\.js/.test(MOD_REQUEST));
     checkTrue("it forces the odd ports through the http engine",
       /force-http-engine-hosts[\s\S]*\*:4480[\s\S]*\*:4483[\s\S]*\*:8000[\s\S]*\*:8082[\s\S]*\*:9102/.test(MOD_REQUEST));
-    checkTrue("its pattern covers mirrors, akam, mcdn and pcdn",
+    checkTrue("its pattern covers mirrors, akam, Hong Kong, mcdn and pcdn",
       /pattern=\^https\?:/.test(MOD_REQUEST) && /mcdn/.test(MOD_REQUEST) &&
-      /4480/.test(MOD_REQUEST) && /akamaized/.test(MOD_REQUEST));
+      /cn-hk-eq-/.test(MOD_REQUEST) && /4480/.test(MOD_REQUEST) && /akamaized/.test(MOD_REQUEST));
+    checkTrue("its mitm list covers the Hong Kong hosts too",
+      /\[MITM\][\s\S]*cn-hk-eq-\*/.test(MOD_REQUEST));
     checkTrue("it passes the four targets to the script",
       ["hostOverseaVideo", "hostBStar", "hostPcdn", "hostMcdn"]
         .every((k) => MOD_REQUEST.indexOf(k + "={{{" + k + "}}}") !== -1));

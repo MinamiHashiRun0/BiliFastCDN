@@ -1,5 +1,5 @@
 #!name=BiliFastCDN · B站CDN加速
-#!desc=v1.1.0 · 请求侧后端移植自 Biliverse/Redirect，目标主机由自动测速排名决定（可填固定主机），附状态面板。
+#!desc=v1.1.1 · 请求侧后端移植自 Biliverse/Redirect，目标主机由自动测速排名决定（可填固定主机），附状态面板。
 #!system=ios
 #!arguments=hostOverseaVideo:auto,hostBStar:auto,hostPcdn:auto,hostMcdn:proxy-tf-all-ws.bilivideo.com,notify:true,debug:false
 #!arguments-desc=hostOverseaVideo:港澳台（*ov、cn-hk-eq-*）与 Akamai 分片的目标主机。填 auto = 用测速最快；填主机名 = 固定用它。 hostBStar:国际版（*bstar1）的目标主机，auto 同上。 hostPcdn:大陆镜像与 PCDN 的目标主机，auto 同上。 hostMcdn:MCDN（:4483/:9102）的代理包裹目标，默认 proxy-tf-all-ws.bilivideo.com。 notify:测速完成后是否发通知。 debug:把每次判定写进请求详情注释。
@@ -23,9 +23,9 @@
 force-http-engine-hosts = %APPEND% upos-*.bilivideo.com:80, cn-hk-eq-*.bilivideo.com:80, upos-*-mirrorakam.akamaized.net:80, *:4480, *:4483, *:486, *:8000, *:8082, *:9102, *:9305
 
 [Script]
-BiliFastCDN-CDN = type=http-request,pattern=^https?://(upos-[a-z0-9-]+\.bilivideo\.(com|cn|net)|cn-hk-eq-[a-z0-9-]+\.bilivideo\.com|upos-[a-z0-9-]+-mirrorakam\.akamaized\.net|[adbcefxy0-9]+\.mcdn\.bilivideo\.cn|[^/]+:(4480|9305))(?::[0-9]+)?/,timeout=5,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-cdn.js?v=1.1.0,script-update-interval=1800,debug={{{debug}}},argument=hostOverseaVideo={{{hostOverseaVideo}}}&hostBStar={{{hostBStar}}}&hostPcdn={{{hostPcdn}}}&hostMcdn={{{hostMcdn}}}&debug={{{debug}}}
-BiliFastCDN-Probe = type=cron,cronexp="*/30 * * * *",timeout=60,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-speedtest.js?v=1.1.0,script-update-interval=1800,argument=notify={{{notify}}}&debug={{{debug}}}
-BiliFastCDN-Panel = type=generic,timeout=30,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-speedtest.js?v=1.1.0,script-update-interval=1800,argument=notify={{{notify}}}&debug={{{debug}}}
+BiliFastCDN-CDN = type=http-request,pattern=^https?://(upos-[a-z0-9-]+\.bilivideo\.(com|cn|net)|cn-hk-eq-[a-z0-9-]+\.bilivideo\.com|upos-[a-z0-9-]+-mirrorakam\.akamaized\.net|[adbcefxy0-9]+\.mcdn\.bilivideo\.cn|[^/]+:(4480|9305))(?::[0-9]+)?/,timeout=5,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-cdn.js?v=1.1.1,script-update-interval=1800,debug={{{debug}}},argument=hostOverseaVideo={{{hostOverseaVideo}}}&hostBStar={{{hostBStar}}}&hostPcdn={{{hostPcdn}}}&hostMcdn={{{hostMcdn}}}&debug={{{debug}}}
+BiliFastCDN-Probe = type=cron,cronexp="*/30 * * * *",timeout=60,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-speedtest.js?v=1.1.1,script-update-interval=1800,argument=notify={{{notify}}}&debug={{{debug}}}
+BiliFastCDN-Panel = type=generic,timeout=30,script-path=https://raw.githubusercontent.com/MinamiHashiRun0/BiliFastCDN/main/bili-speedtest.js?v=1.1.1,script-update-interval=1800,argument=notify={{{notify}}}&debug={{{debug}}}
 
 [Panel]
 BiliFastCDN = title="B站CDN",content="加载中",style=info,script-name=BiliFastCDN-Panel,update-interval=1

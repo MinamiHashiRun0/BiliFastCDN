@@ -7,7 +7,7 @@
   "use strict";
 
   var TAG = "[BiliFastCDN] ";
-  var VERSION = "1.1.0";
+  var VERSION = "1.1.1";
   var K_RANK = "bili_fast_cdn.rank.v2";
   var K_STATS = "bili_fast_cdn.stats.v1";
 
